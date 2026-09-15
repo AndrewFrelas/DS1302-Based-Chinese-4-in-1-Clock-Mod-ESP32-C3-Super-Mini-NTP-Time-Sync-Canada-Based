@@ -17,12 +17,12 @@ a risky mod and you could end up with a non functional device therefor I take no
 ```
 Bill of materials
 
-Temu "4-in-1" wireless charger alarm clock	1	Boards marked YM-SZ010A V0.1 (green) and YM-SZ010-L V0.5 (white)	~16 landed
-ESP32-C3 SuperMini
-10 kΩ resistor	3	one in series in each bus wire — CE, SCLK, I/O.
-220 Ω resistor	1	series in the temperature line
-2.2 µF capacitor	1	16 V or better; ceramic, film or electrolytic all fine
-Hook-up wire	~5 short lengths	thin, flexible
+1 x Temu "4-in-1" wireless charger alarm clock Boards marked YM-SZ010A V0.1 (green) and YM-SZ010-L V0.5 (white)
+1 x ESP32-C3 SuperMini
+3 x 10 kΩ resistor (one in series in each bus wire — CE, SCLK, I/O.)
+1 x 220 Ω resistor (series in the temperature line)
+1 x 2.2 µF capacitor 16 V or better; ceramic, film or electrolytic all fine
+Hook-up wire for power and wrapping wire for bus wires for chip and temp probe pad
 ```
 On the white board find the DS1302 chip and remove it along with the temperature probe.
 
