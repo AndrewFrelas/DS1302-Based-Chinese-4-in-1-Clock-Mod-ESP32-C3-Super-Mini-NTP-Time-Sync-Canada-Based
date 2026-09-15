@@ -14,7 +14,7 @@ off the clock to get 5v from to power the esp32 C3 Super Mini.
 Furthermore this will require the removal of the DS1302 and the temperature probe and the temp probe and may need to have a offset applied to
 work properly for the temperature and i cant guarantee they will not change the clock or boards in the future so make sure you know this is
 a risky mod and you could end up with a non functional device therefor I take no responsibility for you performing this mod.
-
+```
 Bill of materials
 
 Temu "4-in-1" wireless charger alarm clock	1	Boards marked YM-SZ010A V0.1 (green) and YM-SZ010-L V0.5 (white)	~16 landed
@@ -23,7 +23,7 @@ ESP32-C3 SuperMini
 220 Ω resistor	1	series in the temperature line
 2.2 µF capacitor	1	16 V or better; ceramic, film or electrolytic all fine
 Hook-up wire	~5 short lengths	thin, flexible
-
+```
 On the white board find the DS1302 chip and remove it along with the temperature probe.
 
 The DS1302, and its pinout
