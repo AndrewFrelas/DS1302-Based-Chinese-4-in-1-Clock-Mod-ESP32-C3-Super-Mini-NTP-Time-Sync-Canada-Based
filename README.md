@@ -24,7 +24,7 @@ Hook-up wire for power and wrapping wire for bus wires for chip and temp probe p
 ```
 On the white board find the DS1302 chip and remove it along with the temperature probe.
 
-The DS1302, and its pinout
+The DS1302, and its pinout 1 should be indicated by a dot on the chip.
 
 The DS1302 is an 8-pin trickle-charge timekeeping chip with 31 bytes of static RAM, talking a 3-wire synchronous serial interface.
 
@@ -37,7 +37,7 @@ The DS1302 is an 8-pin trickle-charge timekeeping chip with 31 bytes of static R
         +--------+
 ```
 
-Solder wires to 5,6,7
+ Remove the chip and Solder wires to the pads where pins 5,6,7 use to be.
 
 On the ESP32-C3 SuperMini side solder 3 10 kΩ resistor to the super mini and attach
 
