@@ -43,11 +43,12 @@ Solder wires to 5,6,7
 
 On the ESP32-C3 SuperMini side solder 3 10 kΩ resistor to the super mini and attach
 
-```
+| ESP32-C3 pin | Series resistor | Goes to | Notes |
+|---|---|---|---|
 | GPIO3 | 10 kΩ | DS1302 pad **5** (CE) | input only, rising-edge interrupt |
 | GPIO4 | 10 kΩ | DS1302 pad **7** (SCLK) | input only |
 | GPIO5 | 10 kΩ | DS1302 pad **6** (I/O) | high-Z except when answering a read |
-```
+| GPIO7 | 220 Ω | NTC pad (the ~2 V one) | plus 2.2 µF from that pad to ground |
 
 now for the temperature probe its best to check with a multimeter while the clock is powered each pad as they are unlabeled one will likely 
 be at 5v assuming you are powering the clock with a usbc to usb cable and a 5v usb power brick it is important to check as if you get the wrong
