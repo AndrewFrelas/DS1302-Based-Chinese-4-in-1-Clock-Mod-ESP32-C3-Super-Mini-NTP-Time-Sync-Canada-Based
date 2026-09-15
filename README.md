@@ -10,7 +10,7 @@ I would also like to highlight that I do not have a complete build guide yet but
 off the clock to get 5v from to power the esp32 C3 Super Mini. 
 
 Furthermore this will require the removal of the DS1302 and the temperature probe and furthermore the temp probe emulation may need to have a offset applied to
-work properly display temperature and I cant guarantee they will not change the clock design or boards in the future so make sure you know this is
+work properly so it can display temperature and I cant guarantee they will not change the clock design or boards in the future so make sure you know this is
 a risky mod and you could end up with a non functional device therefor I take no responsibility for you performing this mod.
 ```
 Bill of materials
@@ -69,6 +69,8 @@ Programming the ESP32-C3 SuperMini
 you will need a computer with arduino studio and the esp32 boards loaded on forgive me as i do not have a tutorial for that It has been a long time since
 i added the esp32 boards so i do not remember how its done. Anyhow you will need to edit the .ino file to have your ssid and wifi password then compile and
 flash the file onto your ESP32-C3 SuperMini. After you have done that it should work. 
+
+Note: you will need to also potentially also checkmark off Spoof enabled in the web interface so it will emulate the now missing DS1302 chip in the future i will remove this redundancy as there is no way to keep the DS1302 in place that i have found.
 
 For now I know this is a real basic write up but I wanted to just get the information out and while I did use claude for coding i wanted to write this section
 myself to ensure its accurate. Unlike most I want to be clear in my use of AI and Claude in this project so there is no misconceptions about this being coded
