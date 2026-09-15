@@ -68,7 +68,7 @@ to boot properly all the time.
 Programming the ESP32-C3 SuperMini
 
 you will need a computer with arduino studio and the esp32 boards loaded on forgive me as i do not have a tutorial for that It has been a long time since
-i added the esp32 boards so i do not remember how its done. Anyhow you will need to edit the .ico file to have your ssid and wifi password then compile and
+i added the esp32 boards so i do not remember how its done. Anyhow you will need to edit the .ino file to have your ssid and wifi password then compile and
 flash the file onto your ESP32-C3 SuperMini. After you have done that it should work. 
 
 For now I know this is a real basic write up but I wanted to just get the information out and while I did use claude for coding i wanted to write this section
