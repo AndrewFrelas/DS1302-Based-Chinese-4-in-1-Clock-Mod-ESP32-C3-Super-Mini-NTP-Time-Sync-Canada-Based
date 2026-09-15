@@ -4,7 +4,7 @@
 
 Firmware to drive a Chinese DS1302 based Clock with a charger using a ESP32 C3 Super Mini for NTP Time - Canadian Based API used for temp.
 
-Please note that I have used Claude to quickly code this firmware and I have only been testing this for a few days, It was built mainly for myself and as such there are some limits to the firmware like that the api is Canadian so temperatures will only work in Canada and that the clock has no way of making negative values so everything will show as positive values and it was made using the official government of Canada api. Furthermore it only uses unmanned weather stations though i do plan to change this in the future.
+Please note that I have used Claude to quickly code this firmware and I have only been testing this for a few days, It was built mainly for myself and as such there are some limits to the firmware like that the api is Canadian so temperatures will only work in Canada and that the clock has no way of showing negative values so everything will show as positive values and it was made using the official government of Canada api. Furthermore it only uses unmanned weather stations though i do plan to change this in the future.
 
 I would also like to highlight that I do not have a complete build guide yet but i will post photos of it later including where I tapped
 off the clock to get 5v from to power the esp32 C3 Super Mini. 
