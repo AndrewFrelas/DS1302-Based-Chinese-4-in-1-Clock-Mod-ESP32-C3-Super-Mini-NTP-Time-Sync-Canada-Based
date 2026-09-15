@@ -70,7 +70,7 @@ you will need a computer with arduino studio and the esp32 boards loaded on forg
 i added the esp32 boards so i do not remember how its done. Anyhow you will need to edit the .ino file to have your ssid and wifi password then compile and
 flash the file onto your ESP32-C3 SuperMini. After you have done that it should work. 
 
-Note: you will need to also potentially also checkmark off Spoof enabled in the web interface so it will emulate the now missing DS1302 chip in the future i will remove this redundancy as there is no way to keep the DS1302 in place that i have found. Also the alarm and time set buttons will not function anymore and by default this clock will run 24 hour time now.
+Note: you will need to also potentially also checkmark off Spoof enabled in the web interface so it will emulate the now missing DS1302 chip in the future i will remove this redundancy as there is no way to keep the DS1302 in place that i have found. Also the alarm and time set buttons will not function anymore and by default this clock will run 24 hour time now. Also i recommend you remove the coin cell battery from the white YM-SZ010-L V0.5 board for safety there is no need to keep it.
 
 For now I know this is a real basic write up but I wanted to just get the information out and while I did use claude for coding i wanted to write this section
 myself to ensure its accurate. Unlike most I want to be clear in my use of AI and Claude in this project so there is no misconceptions about this being coded
