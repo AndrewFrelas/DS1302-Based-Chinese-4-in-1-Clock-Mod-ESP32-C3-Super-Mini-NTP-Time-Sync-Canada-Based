@@ -51,7 +51,7 @@
 // One NTP server. No fallback servers are configured and DHCP-supplied NTP servers are
 // rejected. Public pool servers: the NTP Pool asks for no more than 4-5 queries per hour,
 // so use a local NTP server (router, NAS, pfSense) if you want minute-level polling.
-#define DEFAULT_NTP_SERVER      "ca.pool.ntp.org"
+#define DEFAULT_NTP_SERVER      "time.chu.nrc.ca"
 #define DEFAULT_TZ              "EST5EDT,M3.2.0,M11.1.0"   // POSIX rule, America/Toronto
 #define DEFAULT_SYNC_INTERVAL_S 60                  // NTP poll interval, seconds
 #define DEFAULT_DST_MODE        0                   // 0 = follow zone rule, 1 = standard only, 2 = daylight only
