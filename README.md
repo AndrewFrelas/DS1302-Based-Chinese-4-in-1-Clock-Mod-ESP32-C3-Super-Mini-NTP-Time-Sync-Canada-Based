@@ -68,7 +68,7 @@ Programming the ESP32-C3 SuperMini
 
 you will need a computer with arduino studio and the esp32 boards loaded on forgive me as i do not have a tutorial for that It has been a long time since
 i added the esp32 boards so i do not remember how its done. Anyhow you will need to edit the .ino file to have your ssid and wifi password then compile and
-flash the file onto your ESP32-C3 SuperMini. After you have done that it should work. 
+flash the file onto your ESP32-C3 SuperMini. After you have done that it should work. Also i recommend changing the layout to huge app before flashing in Arduino studio.
 
 Note: you will need to also potentially also checkmark off Spoof enabled in the web interface so it will emulate the now missing DS1302 chip in the future i will remove this redundancy as there is no way to keep the DS1302 in place that i have found. Also the alarm and time set buttons will not function anymore and by default this clock will run 24 hour time now. Also i recommend you remove the coin cell battery from the white YM-SZ010-L V0.5 board for safety there is no need to keep it.
 
