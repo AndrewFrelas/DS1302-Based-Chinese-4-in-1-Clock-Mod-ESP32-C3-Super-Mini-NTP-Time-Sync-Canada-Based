@@ -9,8 +9,8 @@ Please note that I have used Claude to quickly code this firmware and I have onl
 I would also like to highlight that I do not have a complete build guide yet but i will post photos of it later including where I tapped
 off the clock to get 5v from to power the esp32 C3 Super Mini. 
 
-Furthermore this will require the removal of the DS1302 and the temperature probe and the temp probe and may need to have a offset applied to
-work properly for the temperature and i cant guarantee they will not change the clock or boards in the future so make sure you know this is
+Furthermore this will require the removal of the DS1302 and the temperature probe and furthermore the temp probe emulation may need to have a offset applied to
+work properly display temperature and I cant guarantee they will not change the clock design or boards in the future so make sure you know this is
 a risky mod and you could end up with a non functional device therefor I take no responsibility for you performing this mod.
 ```
 Bill of materials
