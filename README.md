@@ -22,6 +22,15 @@ Bill of materials
 1 x 2.2 µF capacitor 16 V or better; ceramic, film or electrolytic all fine
 Hook-up wire for power and wrapping wire for bus wires for chip and temp probe pad
 ```
+How to open the case
+
+First Pry up the plastic near the charging pad with a spudger the top plastic is held to the body by plastic clips this will reveal a bunch of screw holes with Philips screws
+Second use a small screw driver to remove all philips screws it will need to be long to fit down the holes
+Third Carefully separate the bottom base from the fabric wrapped top base note there is a led strip that goes around to create a night light it is attached to the white board with the DS1302 and is held in place with a connector and the bottom base is also held in by clips which you will most likely damage.
+You can pop the white board with the DS1302 out from the plastic base by pushing where it is gently on the fabric it is held in by clips and it is necessary to pop the board out to properly preform this mod.
+
+Please note if you are not comfortable with soldering or resoldering and soldering to tiny points I really do not recommend this mod. 
+
 On the white board find the DS1302 chip and remove it along with the temperature probe.
 
 The DS1302, and its pinout 1 should be indicated by a dot on the chip.
