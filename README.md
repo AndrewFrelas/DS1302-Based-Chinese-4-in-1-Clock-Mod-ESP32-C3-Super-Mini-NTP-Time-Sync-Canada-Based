@@ -1,4 +1,4 @@
-# DS1302-Based-Chinese-4-in-1-Clock-Mod-ESP32-C3-Super-Mini-NTP-Time-Sync-Canada-Based-
+# DS1302-Based-Chinese-4-in-1-Clock-Mod-ESP32-C3-Super-Mini-NTP-Time-Sync-Canada-Based
 
 <img src="https://andrewfrelas.com/images/2c648675-4923-4c1a-ac4f-e0c0c9073953.png" alt="Clock">
 
