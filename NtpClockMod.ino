@@ -8,7 +8,7 @@
 
 // ============================================================================ CONFIGURATION
 
-#define FW_VERSION              "01.05.00"
+#define FW_VERSION              "01.05.01"
 
 // ---- Wi-Fi (hardcoded; everything else is settable in the web UI and stored in NVS)
 #define WIFI_SSID               "your-ssid"
@@ -73,6 +73,27 @@
 #define NTP_FAILOVER_MIN_S      90UL
 #define NTP_RETURN_PRIMARY_S    1800UL
 #define NTP_PROBE_S             60UL
+
+// How often ntpPolicy() is allowed to do any real work, in milliseconds.
+//
+// This exists because of a regression, and the reason is worth keeping. The policy reads
+// syncCount() and lastSyncAgeUs(), and BOTH take portENTER_CRITICAL - which raises the
+// interrupt threshold above BUS_INTR_LEVEL and masks the DS1302 CE ISR for their duration.
+// loop() ends in delay(2), so it runs a few hundred times a second; without this gate the
+// policy was taking roughly a thousand critical sections per second, every one of them a
+// window where a CE rise could lose SCLK edges. The watchdog it replaced took ZERO in the
+// steady state, because it bailed on a plain millis() comparison before touching anything.
+//
+// The visible cost was a dropped read now and then, which is a 5 on the face, and a minute
+// flip arriving a poll cycle late because the read that would have carried the new minute was
+// the one that got lost.
+//
+// One second against failover windows of 60 s and 90 s changes nothing that matters.
+//
+// The rule this encodes: anything called from loop() on this project must not take a lock on
+// its common path. The bus ISR is the highest-value thing in the system and every critical
+// section anywhere else is time it cannot run.
+#define NTP_POLICY_PERIOD_MS    1000UL
 #define DEFAULT_TZ              "EST5EDT,M3.2.0,M11.1.0"   // POSIX rule, America/Toronto
 #define DEFAULT_SYNC_INTERVAL_S 60                  // NTP poll interval, seconds
 #define DEFAULT_DST_MODE        0                   // 0 = follow zone rule, 1 = standard only, 2 = daylight only
@@ -4204,9 +4225,14 @@ bool     g_mdnsStarted = false;
 // policy. Silence is judged on the global last-sync age, which is sound here precisely because
 // only one server is ever installed: any sync in the window came from the active one.
 void ntpPolicy() {
+  // Cheapest possible test first, ahead of anything that locks. See NTP_POLICY_PERIOD_MS.
+  const uint32_t now = millis();
+  static uint32_t lastCheckMs = 0;
+  if (now - lastCheckMs < NTP_POLICY_PERIOD_MS) return;
+  lastCheckMs = now;
+
   if (!WiFi.isConnected()) return;                 // a dead link is not the server's fault
 
-  const uint32_t now = millis();
   uint32_t windowS = timekeeping::syncIntervalS() * NTP_FAILOVER_AFTER_MULT;
   if (windowS < NTP_FAILOVER_MIN_S) windowS = NTP_FAILOVER_MIN_S;
 
