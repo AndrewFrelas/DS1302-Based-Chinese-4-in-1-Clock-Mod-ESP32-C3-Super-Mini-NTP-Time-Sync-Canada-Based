@@ -8,7 +8,7 @@
 
 // ============================================================================ CONFIGURATION
 
-#define FW_VERSION              "01.03.08"
+#define FW_VERSION              "01.05.00"
 
 // ---- Wi-Fi (hardcoded; everything else is settable in the web UI and stored in NVS)
 #define WIFI_SSID               "your-ssid"
@@ -52,14 +52,55 @@
 // rejected. Public pool servers: the NTP Pool asks for no more than 4-5 queries per hour,
 // so use a local NTP server (router, NAS, pfSense) if you want minute-level polling.
 #define DEFAULT_NTP_SERVER      "time.chu.nrc.ca"
+#define DEFAULT_NTP_SERVER2     "time.nrc.ca"       // empty string = slot unused
+#define DEFAULT_NTP_SERVER3     ""
+#define NTP_SERVER_SLOTS        3
+
+// Failover policy. lwIP's own multi-server handling is round-robin and STICKY: one 15 s
+// timeout moves to the next slot and it stays there for good, so a single blip permanently
+// demotes the primary. So lwIP is given exactly ONE server at a time in slot 0 and the policy
+// lives in ntpPolicy(), where it can be reasoned about. With no other slot populated lwIP's
+// internal index cannot move at all.
+//
+// A server that has not answered within NTP_PROBE_S of being selected is passed over. One that
+// has answered is judged on ongoing silence instead, over NTP_FAILOVER_AFTER_MULT poll
+// intervals floored at NTP_FAILOVER_MIN_S. While running on a fallback the primary is retried
+// every NTP_RETURN_PRIMARY_S and keeps the slot if it answers.
+//
+// NTP_FAILOVER_DEFAULT false gives strict single-server operation. Runtime-settable either way.
+#define NTP_FAILOVER_DEFAULT    true
+#define NTP_FAILOVER_AFTER_MULT 2
+#define NTP_FAILOVER_MIN_S      90UL
+#define NTP_RETURN_PRIMARY_S    1800UL
+#define NTP_PROBE_S             60UL
 #define DEFAULT_TZ              "EST5EDT,M3.2.0,M11.1.0"   // POSIX rule, America/Toronto
 #define DEFAULT_SYNC_INTERVAL_S 60                  // NTP poll interval, seconds
 #define DEFAULT_DST_MODE        0                   // 0 = follow zone rule, 1 = standard only, 2 = daylight only
 #define DEFAULT_HOUR_FORMAT     0                   // 0 = follow the MCU, 1 = 24 hour, 2 = 12 hour
+
+// Firmware-level hour format override. DEFAULT_HOUR_FORMAT above is only the FIRST-BOOT value:
+// once anything is in NVS the compiled-in value is never read again, so it cannot pin the
+// format on a unit that has already been configured. This one can - it outranks NVS and the
+// web UI and is evaluated on every image build.
+//   0 = no override, use the stored setting   1 = always 24 hour   2 = always 12 hour
+// Worth knowing: "auto" learns from the MCU writing the hours register, and with the DS1302
+// removed that only happens if the time is set with the clock's own buttons. On a fresh build
+// there is usually nothing to learn from, so auto sits on 24 hour indefinitely.
+#define HOUR_FORMAT_FORCE       0
 #define DEFAULT_SPOOF_ENABLED   false               // off until the passive bus check passes
 #define DEFAULT_BOOT_COUNTDOWN  true                // show 00:00, 03:00, 02:00, 01:00 on first arm
 
 // Poll interval limits. 15 s is the floor enforced by SNTP (RFC 4330).
+// Crystal drift. The estimator is two-point: NTP time elapsed against esp_timer elapsed from a
+// baseline taken at the first sync. Its noise floor is 2 * jitter / span, so at a 300 s span
+// with 10 ms of sync jitter the figure carries about +/- 67 ppm of uncertainty - larger than
+// the tens of ppm it is measuring. The old gate declared it valid there, which is why a cold
+// boot reported figures like 127 ppm. These are the spans at which it is worth quoting.
+#define DRIFT_PPM_LIMIT         250.0f    // discard any estimate outside +/- this: bad data
+#define DRIFT_VALID_SPAN_S      3600UL    // baseline before the figure is trusted
+#define DRIFT_SYNC_JITTER_US    10000.0f  // assumed per-endpoint sync jitter, for the error bar
+#define DRIFT_RECENT_MIN_SPAN_S 1800UL    // shortest window for the recent-rate diagnostic
+
 #define NTP_MIN_INTERVAL_S      15UL
 #define NTP_MAX_INTERVAL_S      86400UL
 
@@ -78,24 +119,6 @@
 // ---- Bus engine
 #define IO_DRIVE_STRENGTH       3   // PIN_IO drive capability 0..3 (3 = strongest: 40 mA source)
 #define BUS_INTR_LEVEL          3   // CE ISR interrupt level 1..3 (3 = lowest entry latency)
-
-// Consecutive samples of CE low required to believe the transfer has ended. The poll loop
-// runs every few hundred nanoseconds, so this is well under a microsecond - far shorter than
-// a genuine end of transfer, which holds CE low until the next poll cycle hundreds of
-// milliseconds later. It therefore cannot miss a real one.
-//
-// Why it exists: a SINGLE noisy low sample used to end a read in flight. The ISR then
-// released the line and every remaining bit clocked back as 0. Zeros are valid BCD, so the
-// MCU latched a plausible wrong time rather than obvious garbage. Hours 23 (0x23,
-// 0b00100011) cut after five bits reads 0b00000011 = 0x03, which is the "display randomly
-// shows 03" report; the same cut at 20-22h gives 00, 01, 02, which is the "stuck on 00:00"
-// report. Below 20:00 the high bits are already zero so the fault is invisible - which is why
-// it only ever got noticed late in the evening.
-//
-// This board is a wireless charger and the tap is a flying wire, so CE glitches are expected;
-// the ISR entry path already flagged TF_CE_GLITCH for them. Mid-transfer had no such guard.
-// Set 1 to restore the old single-sample behaviour.
-#define BUS_CE_LOW_CONFIRM      3
 
 // ---- DS1302 physically removed: full emulation
 // 1 = the DS1302 is OUT and the ESP32 is the only thing that can answer the MCU. It then
@@ -168,7 +191,25 @@
 // 8 means +8 and an 8 that drops to 0 and back means -8. Set to 0 for plain magnitude.
 // The MCU's own ADC sampling rate is unknown: if the blink reads as an average instead of
 // two distinct numbers, raise both periods until it steps cleanly.
-#define TEMP_NEG_BLINK          1
+// Whole-degree targeting. The face shows whole degrees, so aiming at a fractional value puts
+// the target next to a boundary the MCU's own conversion decides, and a reading sitting at
+// 21.9 can land either side of it depending on ripple and temperature. Aiming at a whole
+// degree puts the target in the middle of the band that displays that number.
+//   0 = send the exact value      1 = truncate toward zero: 21.9 -> 21, -3.7 -> -3
+//   2 = round to nearest: 21.9 -> 22, -3.7 -> -4
+// 1 and 2 are equally stable; the stability comes from landing on a whole number. 2 is never
+// more than half a degree out where 1 can be a full degree, so if the face reads a degree low,
+// try 2 before touching the offset. Applied BEFORE the calibration offset, so a sub-degree
+// nudge is not thrown away by the rounding.
+#define TEMP_WHOLE_DEGREES      1
+
+// Sub-zero handling. The display has no minus sign and the MCU has no notion of a negative
+// temperature, so a negative reading is sent as its MAGNITUDE and nothing else: -4 C shows as
+// 4. A deliberate loss of information - the alternative was blinking between the magnitude and
+// 0 C to hint at the sign, which encodes a meaning the hardware cannot express and reads as a
+// fault rather than a minus sign.
+//   0 = magnitude only, steady   1 = alternate between the magnitude and 0 C while below zero
+#define TEMP_NEG_BLINK          0
 #define TEMP_NEG_HIGH_MS        4000UL    // time showing the magnitude
 #define TEMP_NEG_LOW_MS         2000UL    // time showing 0 C
 
@@ -185,7 +226,18 @@
 #define WX_USE_HTTPS            1
 #define WX_HOST                 "dd.weather.gc.ca"
 #define WX_PATH_PREFIX          "/today/observations/swob-ml/latest/"
+// Station file naming is not uniform: automatic stations publish as <CODE>-AUTO-swob.xml and
+// staffed ones as <CODE>-MAN-swob.xml. 99 of the 871 files in the directory are MAN, so it is
+// not an edge case - Pearson is CYYZ-MAN and Hamilton is CYHM-MAN, while Burlington Pier,
+// Toronto City and Billy Bishop are all AUTO.
+//
+// A bare code probes AUTO then MAN with a HEAD request and caches the winner, so the normal
+// path stays a single GET. A code containing "-" is taken verbatim as a full stem and never
+// probed. A 404 retries the other suffix and re-caches only on a 200, so a station that
+// changes category fixes itself and a transient outage cannot corrupt the cache.
 #define WX_PATH_SUFFIX          "-AUTO-swob.xml"
+#define WX_PATH_SUFFIX_ALT      "-MAN-swob.xml"
+#define WX_PROBE_TIMEOUT_MS     8000
 #define WX_STATION_DEFAULT      "CWWB"
 #define WX_FETCH_INTERVAL_S     600UL     // observation is hourly; this just recovers misses
 #define WX_RETRY_S              120UL     // after a failed attempt
@@ -374,7 +426,6 @@ enum : uint16_t {
   TF_TIMEOUT    = 1u << 10,  // aborted mid-transaction (edge timeout / budget)
   TF_COMPLETE   = 1u << 11,  // every expected data bit was clocked
   TF_LATE_EDGE  = 1u << 12,  // SCLK rose before the ISR started: observed, never answered
-  TF_CE_BOUNCE  = 1u << 13,  // CE read low mid-transfer but recovered: glitch, not an end
 };
 
 struct TxnRecord {
@@ -410,7 +461,7 @@ class BusMachine {
     for (uint8_t i = 0; i < 8; ++i) { img_[i] = img[i]; rec_.data[i] = 0; }
     rec_.t0Us = t0Us; rec_.durUs = 0; rec_.spanUs = 0;
     rec_.flags = 0; rec_.rises = 0; rec_.dataBits = 0; rec_.cmd = 0;
-    phase_ = PH_CMD; bits_ = 0; cmd_ = 0; nBytes_ = 0; ceLow_ = 0;
+    phase_ = PH_CMD; bits_ = 0; cmd_ = 0; nBytes_ = 0;
     outIdx_ = 0; capBits_ = 0; wIdx_ = 0; srcByte_ = 0;
     spoof_ = false; burst_ = false; driving_ = false;
     prev_ = in;
@@ -426,15 +477,7 @@ class BusMachine {
 
   // Feed one GPIO sample. `nowUs` is only read on SCLK rising edges.
   DS_INLINE uint8_t step(uint32_t in, int64_t nowUs) {
-    if (!(in & p_.ce)) {
-      // Require BUS_CE_LOW_CONFIRM consecutive low samples. One glitched sample used to end
-      // the transfer here, releasing the line and zeroing every bit the MCU had left to
-      // clock. See the note on BUS_CE_LOW_CONFIRM for why that shows up as 03 or 00:00.
-      if (++ceLow_ >= BUS_CE_LOW_CONFIRM) return endOfTransfer();
-      rec_.flags |= TF_CE_BOUNCE;
-      return 0;
-    }
-    ceLow_ = 0;
+    if (!(in & p_.ce)) return endOfTransfer();
     if (!((in ^ prev_) & p_.sclk)) {                 // no clock edge
       if (!(in & p_.sclk)) lowIo_ = in & p_.io;
       return 0;
@@ -470,8 +513,6 @@ class BusMachine {
   }
 
   DS_INLINE bool driving() const { return driving_; }
-
-  uint8_t ceLow_ = 0;      // consecutive CE-low samples seen in this transfer
 
  private:
   enum : uint8_t { PH_CMD, PH_READ, PH_WRITE };
@@ -735,7 +776,6 @@ struct BusCounters {
   uint32_t longTxn;       // skipped: RAM burst
   uint32_t timeouts;      // aborted mid-transaction
   uint32_t incomplete;    // CE dropped before all data bits were clocked
-  uint32_t ceBounces;     // transfers where a CE low sample was rejected as a glitch
   uint32_t spanUsSum;     // sum of first->last SCLK rising edge spans
   uint32_t spanPeriods;   // sum of (rising edges - 1)
 };
@@ -844,7 +884,6 @@ IRAM_ATTR void publish(const TxnRecord& r) {
   s.lastCeUs = r.t0Us;
 
   if (f & TF_CE_GLITCH)  ++c.glitches;
-  if (f & TF_CE_BOUNCE)  ++c.ceBounces;
   if (f & TF_MISALIGNED) ++c.misaligned;
   if (f & TF_LATE_EDGE)  ++c.lateEdge;
   if (f & TF_TIMEOUT)    ++c.timeouts;
@@ -1034,14 +1073,20 @@ enum : uint8_t { HOURFMT_AUTO = 0, HOURFMT_24 = 1, HOURFMT_12 = 2 };
 enum : uint8_t { DST_AUTO = 0, DST_STANDARD = 1, DST_DAYLIGHT = 2 };
 
 struct Settings {
+  // lwIP is handed these by POINTER and keeps them for as long as it runs, so they live here,
+  // at file scope, and are never moved or freed.
   char     ntpServer[64];
+  char     ntpServer2[64];    // empty = slot unused
+  char     ntpServer3[64];
+  bool     ntpFailover;       // false = slot 0 only, never try another server
   char     tz[64];            // POSIX rule as chosen in the UI, before the DST mode is applied
   uint32_t syncIntervalS;
   uint8_t  dstMode;
   uint8_t  hourFormat;
   bool     spoofEnabled;
   bool     bootCountdown;
-  char     wxStation[8];      // SWOB-ML station code, e.g. CWWB
+  char     wxStation[16];     // SWOB-ML code (CWWB) or a full stem (CYYZ-MAN)
+  char     wxSuffix[16];      // cached winning suffix for a bare code
   int8_t   wifiTxDbm;         // 2..20, quantised by the radio to the steps above
   uint8_t  wifiPsMode;        // 0 none, 1 min modem, 2 max modem
 };
@@ -1097,16 +1142,24 @@ int8_t quantiseTxDbm(int v) {
   return WIFI_TX_STEPS[0];
 }
 
-// SWOB-ML station code: 3..7 characters, upper-case letters and digits only.
+// SWOB-ML station: a bare code (CWWB) or a full stem (CYYZ-MAN). The value is concatenated
+// straight into a URL path, so the character set is deliberately ONE character wider than it
+// was and no wider: '/', '.' and '%' are a path-traversal surface and stay out. Leading,
+// trailing and doubled hyphens are rejected because none of them can name a real file.
 bool validWxStation(const char* s) {
   const size_t n = std::strlen(s);
-  if (n < 3 || n > 7) return false;
+  if (n < 3 || n > 14) return false;
+  if (s[0] == '-' || s[n - 1] == '-') return false;
   for (size_t i = 0; i < n; ++i) {
     const char c = s[i];
+    if (c == '-') { if (s[i + 1] == '-') return false; continue; }
     if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) return false;
   }
   return true;
 }
+
+// True when the value already names a complete stem and must not be probed.
+bool wxStationIsStem(const char* s) { return std::strchr(s, '-') != nullptr; }
 
 // POSIX TZ character set, 3..63 characters, and it must parse as a rule.
 bool validTz(const char* s) {
@@ -1160,6 +1213,10 @@ void effectiveTz(char* out, size_t n) {
 
 void load() {
   impl::copyStr(g_settings.ntpServer, sizeof g_settings.ntpServer, DEFAULT_NTP_SERVER);
+  impl::copyStr(g_settings.ntpServer2, sizeof g_settings.ntpServer2, DEFAULT_NTP_SERVER2);
+  impl::copyStr(g_settings.ntpServer3, sizeof g_settings.ntpServer3, DEFAULT_NTP_SERVER3);
+  g_settings.ntpFailover = NTP_FAILOVER_DEFAULT;
+  impl::copyStr(g_settings.wxSuffix, sizeof g_settings.wxSuffix, WX_PATH_SUFFIX);
   impl::copyStr(g_settings.tz, sizeof g_settings.tz, DEFAULT_TZ);
   g_settings.syncIntervalS = DEFAULT_SYNC_INTERVAL_S;
   g_settings.dstMode = DEFAULT_DST_MODE;
@@ -1175,6 +1232,22 @@ void load() {
   char buf[64];
   if (p.isKey("ntp") && p.getString("ntp", buf, sizeof buf) > 0 && validNtpServer(buf))
     impl::copyStr(g_settings.ntpServer, sizeof g_settings.ntpServer, buf);
+  // getString returns 0 WITHOUT writing to buf on a read error, and buf is shared across every
+  // read here, so a failure would otherwise leave the PREVIOUS key's value in place - the
+  // primary's hostname, which validates fine and turns slot 1 into a duplicate of slot 0.
+  // Failing over to the same dead host is worse than having no fallback. Clearing buf first
+  // makes a read error indistinguishable from an empty value, which is the safe reading.
+  if (p.isKey("ntp2")) {
+    buf[0] = '\0'; p.getString("ntp2", buf, sizeof buf);
+    if (buf[0] == '\0' || validNtpServer(buf))
+      impl::copyStr(g_settings.ntpServer2, sizeof g_settings.ntpServer2, buf);
+  }
+  if (p.isKey("ntp3")) {
+    buf[0] = '\0'; p.getString("ntp3", buf, sizeof buf);
+    if (buf[0] == '\0' || validNtpServer(buf))
+      impl::copyStr(g_settings.ntpServer3, sizeof g_settings.ntpServer3, buf);
+  }
+  g_settings.ntpFailover = p.getBool("ntpfo", NTP_FAILOVER_DEFAULT);
   if (p.isKey("tz") && p.getString("tz", buf, sizeof buf) > 0 && validTz(buf))
     impl::copyStr(g_settings.tz, sizeof g_settings.tz, buf);
   g_settings.syncIntervalS = clampInterval(p.getULong("ival", DEFAULT_SYNC_INTERVAL_S));
@@ -1186,6 +1259,9 @@ void load() {
   g_settings.bootCountdown = p.getBool("bootcd", DEFAULT_BOOT_COUNTDOWN);
   if (p.isKey("wxstn") && p.getString("wxstn", buf, sizeof buf) > 0 && validWxStation(buf))
     impl::copyStr(g_settings.wxStation, sizeof g_settings.wxStation, buf);
+  if (p.isKey("wxsfx") && p.getString("wxsfx", buf, sizeof buf) > 0 &&
+      (!std::strcmp(buf, WX_PATH_SUFFIX) || !std::strcmp(buf, WX_PATH_SUFFIX_ALT)))
+    impl::copyStr(g_settings.wxSuffix, sizeof g_settings.wxSuffix, buf);
   g_settings.wifiTxDbm = quantiseTxDbm(p.getChar("wtx", WIFI_TX_DBM_DEFAULT));
   const uint8_t ps = p.getUChar("wps", WIFI_PS_MODE_DEFAULT);
   g_settings.wifiPsMode = ps <= 2 ? ps : (uint8_t)0;
@@ -1196,6 +1272,12 @@ bool save() {
   Preferences p;
   if (!p.begin(impl::NVS_NS, false)) return false;
   bool ok = p.putString("ntp", g_settings.ntpServer) > 0;
+  // Preferences::putString returns size_t: strlen(value) on success and 0 on FAILURE, so an
+  // empty value and a failed write return the same thing. The only sound test is against the
+  // length that was asked for.
+  ok = (p.putString("ntp2", g_settings.ntpServer2) == std::strlen(g_settings.ntpServer2)) && ok;
+  ok = (p.putString("ntp3", g_settings.ntpServer3) == std::strlen(g_settings.ntpServer3)) && ok;
+  ok = p.putBool("ntpfo", g_settings.ntpFailover) > 0 && ok;
   ok = p.putString("tz", g_settings.tz) > 0 && ok;
   ok = p.putULong("ival", g_settings.syncIntervalS) > 0 && ok;
   ok = p.putUChar("dst", g_settings.dstMode) > 0 && ok;
@@ -1203,6 +1285,7 @@ bool save() {
   ok = p.putBool("spoof", g_settings.spoofEnabled) > 0 && ok;
   ok = p.putBool("bootcd", g_settings.bootCountdown) > 0 && ok;
   ok = p.putString("wxstn", g_settings.wxStation) > 0 && ok;
+  ok = p.putString("wxsfx", g_settings.wxSuffix) > 0 && ok;
   ok = p.putChar("wtx", g_settings.wifiTxDbm) > 0 && ok;
   ok = p.putUChar("wps", g_settings.wifiPsMode) > 0 && ok;
   p.end();
@@ -1226,6 +1309,18 @@ int64_t           lastSyncUs_ = -1;
 int64_t           baseNtpUs_ = 0;       // NTP time at the drift baseline sync, microseconds
 int64_t           baseEspUs_ = 0;       // esp_timer at that same sync
 bool              haveBase_ = false;
+// Mid-point sample. The long baseline gives the low-noise figure; a second sample taken part
+// way along gives a recent-window rate, which is what moves when the board's temperature does.
+// Without it a rate shift takes as long to show as the whole baseline, because a two-point
+// estimate from a fixed origin averages everything since boot.
+int64_t           midNtpUs_ = 0;
+int64_t           midEspUs_ = 0;
+bool              haveMid_ = false;
+float             recentPpm_ = 0.0f;
+uint32_t          recentSpanS_ = 0;
+uint8_t           activeSlot_ = 0;      // which configured server is currently installed
+uint32_t          slotSinceMs_ = 0;     // millis() when it was installed
+uint32_t          slotSyncCount_ = 0;   // syncCount_ then; proves THIS server replied
 float             driftPpm_ = 0.0f;     // crystal fast(+) / slow(-) versus NTP
 uint32_t          driftSpanS_ = 0;      // baseline length the figure is measured over
 uint32_t          syncCount_ = 0;
@@ -1233,24 +1328,65 @@ uint32_t          intervalS_ = DEFAULT_SYNC_INTERVAL_S;
 
 constexpr time_t PLAUSIBLE_EPOCH = 1735689600;   // 2025-01-01T00:00:00Z
 
+// Crystal drift: esp_timer measures elapsed time on the local crystal, NTP measures the real
+// elapsed time. The difference over a long baseline is the crystal error.
+//
+// Every division below is OUTSIDE the lock, deliberately. This chip has no FPU, so each double
+// operation is a libgcc call in flash costing tens of microseconds, usually cold - and
+// portENTER_CRITICAL raises the interrupt threshold above BUS_INTR_LEVEL, masking the DS1302
+// CE ISR for the whole window. A CE rise landing in it loses SCLK edges. Only the stores are
+// protected. Reading the baselines unlocked is safe: this callback is their only writer.
 void onSync(struct timeval* tv) {                // runs in the lwIP task
   const int64_t now = esp_timer_get_time();
+  const int64_t ntpUs = (int64_t)tv->tv_sec * 1000000LL + (int64_t)tv->tv_usec;
+
+  bool  haveLong = false, haveRecent = false, rollMid = false, setBase = false;
+  float longPpm = 0.0f, recentPpm = 0.0f;
+  uint32_t longSpan = 0, recentSpan = 0;
+
+  if (!haveBase_) {
+    setBase = true;
+  } else {
+    const int64_t dNtp = ntpUs - baseNtpUs_;
+    const int64_t dEsp = now - baseEspUs_;
+    if (dNtp > 0) {
+      const float ppm = (float)((double)(dEsp - dNtp) * 1000000.0 / (double)dNtp);
+      // Outside the sanity limit means a bad packet or a stepped clock, not a real rate.
+      if (ppm > -DRIFT_PPM_LIMIT && ppm < DRIFT_PPM_LIMIT) {
+        longPpm = ppm; longSpan = (uint32_t)(dNtp / 1000000LL); haveLong = true;
+      }
+    } else {
+      // The baseline is ahead of this reply, so it came from a bad packet - SNTP steps the
+      // clock to whatever arrives and nothing upstream range-checks it. Left alone this is
+      // permanent: dNtp stays negative for the life of the boot and no figure is ever produced
+      // again. Re-anchor here instead.
+      setBase = true;
+    }
+    if (haveMid_) {
+      const int64_t rNtp = ntpUs - midNtpUs_;
+      const int64_t rEsp = now - midEspUs_;
+      if (rNtp >= (int64_t)DRIFT_RECENT_MIN_SPAN_S * 1000000LL) {
+        const float ppm = (float)((double)(rEsp - rNtp) * 1000000.0 / (double)rNtp);
+        if (ppm > -DRIFT_PPM_LIMIT && ppm < DRIFT_PPM_LIMIT) {
+          recentPpm = ppm; recentSpan = (uint32_t)(rNtp / 1000000LL); haveRecent = true;
+        }
+        rollMid = true;
+      } else if (rNtp < 0) {
+        rollMid = true;
+      }
+    } else {
+      rollMid = true;
+    }
+  }
+
   portENTER_CRITICAL(&mux_);
   lastSyncEpoch_ = tv->tv_sec;
   lastSyncUs_ = now;
   ++syncCount_;
-  // Crystal drift: esp_timer measures elapsed time on the local crystal, NTP measures the
-  // real elapsed time. The difference over a long baseline is the crystal error.
-  const int64_t ntpUs = (int64_t)tv->tv_sec * 1000000LL + (int64_t)tv->tv_usec;
-  if (!haveBase_) { baseNtpUs_ = ntpUs; baseEspUs_ = now; haveBase_ = true; }
-  else {
-    const int64_t dNtp = ntpUs - baseNtpUs_;
-    const int64_t dEsp = now - baseEspUs_;
-    if (dNtp > 0) {
-      driftPpm_ = (float)((double)(dEsp - dNtp) * 1000000.0 / (double)dNtp);
-      driftSpanS_ = (uint32_t)(dNtp / 1000000LL);
-    }
-  }
+  if (setBase)    { baseNtpUs_ = ntpUs; baseEspUs_ = now; haveBase_ = true; driftSpanS_ = 0; }
+  if (haveLong)   { driftPpm_ = longPpm; driftSpanS_ = longSpan; }
+  if (haveRecent) { recentPpm_ = recentPpm; recentSpanS_ = recentSpan; }
+  if (rollMid)    { midNtpUs_ = ntpUs; midEspUs_ = now; haveMid_ = true; }
   portEXIT_CRITICAL(&mux_);
 }
 
@@ -1274,6 +1410,23 @@ void begin(const char* ntpServer, const char* tz, uint32_t intervalS) {
 }
 
 // (Re)start SNTP: one server, no fallbacks, no DHCP-supplied servers, immediate request.
+// The configured server for one of our slots, or an empty string if that slot is unused.
+const char* slotServer(uint8_t i) {
+  if (i == 1) return g_settings.ntpServer2;
+  if (i == 2) return g_settings.ntpServer3;
+  return g_settings.ntpServer;
+}
+
+bool slotUsable(uint8_t i) {
+  if (i > 0 && !g_settings.ntpFailover) return false;   // failover off: only slot 0 exists
+  return slotServer(i)[0] != '\0';
+}
+
+// (Re)start SNTP with exactly ONE server - whichever slot is active - in lwIP slot 0, every
+// other slot cleared. lwIP's own selection is round-robin and sticky, so a single timeout on
+// the primary would demote it permanently; with no other slot populated its index cannot move
+// and the policy is entirely ours. The pointer lwIP keeps is always impl::server_, one buffer
+// that outlives every restart, so a settings edit cannot move a string it may be resolving.
 void restart() {
   if (esp_sntp_enabled()) esp_sntp_stop();
   esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
@@ -1289,10 +1442,48 @@ void restart() {
   esp_sntp_init();
 }
 
+// Install one of our slots as the single lwIP server.
+void selectSlot(uint8_t slot) {
+  if (slot >= NTP_SERVER_SLOTS) slot = 0;
+  const char* name = slotServer(slot);
+  if (name[0] == '\0') { slot = 0; name = slotServer(0); }
+  if (name[0] == '\0') return;                     // nothing configured at all
+  if (esp_sntp_enabled()) esp_sntp_stop();
+  std::strncpy(impl::server_, name, sizeof impl::server_ - 1);
+  impl::server_[sizeof impl::server_ - 1] = '\0';
+  impl::activeSlot_ = slot;
+  impl::slotSinceMs_ = millis();
+  portENTER_CRITICAL(&impl::mux_);
+  impl::slotSyncCount_ = impl::syncCount_;
+  portEXIT_CRITICAL(&impl::mux_);
+  restart();
+}
+
+uint8_t  activeSlot()    { return impl::activeSlot_; }
+uint32_t slotSinceMs()   { return impl::slotSinceMs_; }
+uint32_t slotSyncCount() { return impl::slotSyncCount_; }
+
+// The next usable slot after `from`, wrapping. Returns `from` when nothing else is configured,
+// so a lone-server setup degenerates into a plain restart rather than a special case.
+uint8_t nextUsableSlot(uint8_t from) {
+  for (uint8_t step = 1; step <= NTP_SERVER_SLOTS; ++step) {
+    const uint8_t cand = (uint8_t)((from + step) % NTP_SERVER_SLOTS);
+    if (slotUsable(cand)) return cand;
+  }
+  return from;
+}
+
+// Editing a server is an explicit statement of intent, so it re-anchors on the primary rather
+// than leaving the device on a fallback it was sent to before the change.
 void setServer(const char* ntpServer) {
   if (esp_sntp_enabled()) esp_sntp_stop();         // stop before the buffer changes
   std::strncpy(impl::server_, ntpServer, sizeof impl::server_ - 1);
   impl::server_[sizeof impl::server_ - 1] = '\0';
+  impl::activeSlot_ = 0;
+  impl::slotSinceMs_ = millis();
+  portENTER_CRITICAL(&impl::mux_);
+  impl::slotSyncCount_ = impl::syncCount_;
+  portEXIT_CRITICAL(&impl::mux_);
   restart();
 }
 
@@ -1333,7 +1524,20 @@ uint32_t syncCount() {
 bool everSynced() { return syncCount() > 0; }
 
 // Measured crystal drift versus NTP. Valid once the baseline is long enough to be meaningful.
-bool     driftValid() { return impl::driftSpanS_ >= 300; }
+// Valid once the baseline is long enough for the figure to beat its own noise. The old gate
+// was 300 s, where a two-point estimate carries about +/- 67 ppm of uncertainty - larger than
+// the quantity it measures, which is why a cold boot used to report figures like 127 ppm.
+bool     driftValid() { return impl::driftSpanS_ >= DRIFT_VALID_SPAN_S; }
+float    driftRecentPpm()   { return impl::recentPpm_; }
+uint32_t driftRecentSpanS() { return impl::recentSpanS_; }
+
+// One-sigma uncertainty of the current estimate, in ppm. NEGATIVE when nothing has been
+// measured at all: returning 0 there reads exactly like a perfectly measured zero.
+float driftUncertaintyPpm() {
+  const uint32_t span = impl::driftSpanS_;
+  if (span == 0) return -1.0f;
+  return (2.0f * DRIFT_SYNC_JITTER_US) / (float)span;
+}
 float    driftPpm()   { return impl::driftPpm_; }
 uint32_t driftSpanS() { return impl::driftSpanS_; }
 
@@ -1391,9 +1595,15 @@ uint32_t     countdownStartedMs_ = 0;
 const uint8_t COUNTDOWN_HOURS[4] = { 0, 3, 2, 1 };
 
 ds1302::HourMode resolveHourMode() {
+#if HOUR_FORMAT_FORCE == 1
+  return ds1302::HourMode::H24;              // pinned in firmware, outranks NVS and the UI
+#elif HOUR_FORMAT_FORCE == 2
+  return ds1302::HourMode::H12;
+#else
   if (g_settings.hourFormat == HOURFMT_12) return ds1302::HourMode::H12;
   if (g_settings.hourFormat == HOURFMT_24) return ds1302::HourMode::H24;
   return bus::learnedHour() == 1 ? ds1302::HourMode::H12 : ds1302::HourMode::H24;
+#endif
 }
 
 bool ntpFresh() {
@@ -2106,538 +2316,563 @@ uint32_t downSeconds() {
 // preprocessor, which corrupts the served HTML. A byte array is immune. Regenerate from
 // web_page.h if the page changes.
 static const uint8_t INDEX_HTML_GZ[] PROGMEM = {
-  31,139,8,0,122,35,166,106,2,255,197,125,253,119,218,70,179,255,239,254,
-  43,182,180,79,2,13,200,128,95,226,128,193,215,113,220,39,105,227,196,39,
-  38,77,159,246,244,18,129,22,80,172,23,170,21,198,142,195,253,219,239,103,
-  102,87,66,2,65,156,220,239,57,223,147,22,208,106,102,118,118,118,118,94,
-  246,205,199,63,56,225,48,190,155,74,49,137,125,175,187,115,76,95,194,179,
-  131,113,167,36,131,82,247,120,34,109,167,123,236,203,216,22,195,137,29,41,
-  25,119,74,179,120,84,59,42,153,210,192,246,101,167,116,227,202,249,52,140,
-  226,146,24,134,65,44,3,64,205,93,39,158,116,28,121,227,14,101,141,31,
-  170,110,224,198,174,237,213,212,208,246,100,167,81,66,125,177,27,123,178,251,
-  166,119,41,206,188,112,120,45,46,66,231,120,87,23,238,28,171,248,142,190,
-  91,81,24,198,247,181,218,96,220,250,113,180,143,127,141,118,173,54,180,35,
-  7,143,163,17,126,143,240,162,49,196,63,27,15,254,44,110,253,120,104,227,
-  223,62,158,60,55,144,173,31,101,93,214,29,122,25,94,3,210,121,106,239,
-  61,195,195,220,142,130,214,143,207,246,15,155,245,58,30,7,54,8,14,246,
-  155,123,141,35,60,217,195,33,129,238,75,231,104,177,243,95,190,116,92,187,
-  60,141,228,72,70,170,54,12,189,48,66,43,38,210,151,45,199,142,174,43,
-  247,89,30,27,123,248,215,76,121,108,56,248,55,48,108,202,1,254,29,37,
-  108,62,27,224,223,65,202,230,94,115,175,217,148,134,205,125,219,145,71,245,
-  148,205,209,96,48,106,238,39,108,142,142,158,54,158,54,18,54,159,218,118,
-  115,52,90,44,118,126,190,31,132,183,53,229,126,118,131,113,107,16,70,142,
-  140,106,40,89,12,66,231,238,222,183,163,177,27,180,234,237,17,186,168,213,
-  216,159,222,238,54,172,253,3,161,238,84,44,253,218,204,173,214,236,233,212,
-  147,53,93,80,189,146,227,80,138,247,175,170,202,14,84,77,201,200,29,181,
-  7,246,240,122,28,133,179,192,105,221,216,81,153,218,91,105,179,56,204,243,
-  104,92,89,236,248,182,27,160,186,91,221,237,173,163,163,250,244,182,157,84,
-  47,236,89,28,182,167,182,227,16,147,141,195,233,237,98,135,180,76,70,247,
-  142,171,166,158,125,215,26,121,242,182,77,31,181,121,100,79,91,244,209,182,
-  61,119,28,212,92,48,166,90,67,40,152,140,218,99,188,3,186,160,166,36,
-  228,241,83,212,133,161,218,184,167,166,146,60,100,171,241,52,195,195,226,199,
-  33,105,27,191,110,29,214,235,162,73,116,102,110,205,15,131,80,77,237,161,
-  172,94,200,192,11,171,103,97,160,66,207,86,213,244,197,98,199,162,110,189,
-  95,147,4,149,86,218,90,232,173,6,200,1,209,117,132,126,73,253,155,188,
-  172,69,182,227,206,84,171,65,82,73,229,64,140,19,219,134,71,116,91,28,
-  135,62,151,163,37,205,108,75,154,128,138,229,109,92,139,35,244,204,40,140,
-  252,214,108,58,149,209,208,86,178,237,201,24,178,169,17,175,68,215,170,63,
-  149,126,174,135,160,120,149,101,103,212,197,17,85,16,219,3,79,222,235,238,
-  106,212,235,255,74,88,5,162,103,79,149,108,37,63,22,177,115,159,240,124,
-  64,178,110,223,200,40,118,49,160,107,220,67,173,56,156,38,200,248,89,44,
-  8,212,23,181,70,110,164,226,218,112,226,122,142,0,209,12,78,29,149,100,
-  95,223,175,177,175,25,221,59,252,87,34,191,90,228,142,39,49,139,6,29,
-  68,157,165,5,54,178,125,215,187,107,61,168,103,219,33,154,50,242,194,185,
-  214,58,59,184,155,79,100,68,29,142,33,55,150,105,179,81,135,120,134,46,
-  200,247,230,51,42,90,233,36,126,156,75,102,13,90,182,174,28,195,89,20,
-  65,151,207,168,125,168,39,12,114,77,13,175,43,11,43,28,141,214,218,191,
-  176,200,38,228,138,169,0,229,224,52,87,140,103,72,219,179,7,210,75,71,
-  215,128,84,63,209,0,82,66,40,1,141,160,181,90,118,220,96,58,139,255,
-  34,247,208,33,125,251,187,154,41,8,102,254,64,70,127,87,149,244,228,48,
-  206,170,78,34,167,163,84,70,15,26,14,164,251,15,49,47,218,124,185,1,
-  250,198,141,105,52,78,174,243,134,131,204,2,213,93,96,49,86,73,153,177,
-  198,138,202,3,205,138,194,249,58,53,30,169,95,183,71,89,106,90,17,199,
-  145,235,164,228,232,161,77,31,53,32,161,36,150,52,188,102,126,0,83,48,
-  138,4,254,231,202,18,235,101,124,206,210,140,194,77,77,111,43,247,154,232,
-  70,58,240,2,131,25,76,71,112,159,149,83,182,83,180,189,44,16,126,113,
-  95,193,195,84,214,59,134,75,181,56,217,9,67,147,21,126,79,67,151,68,
-  145,240,96,41,57,204,90,74,54,88,83,155,116,62,215,23,68,109,161,81,
-  90,16,23,25,35,231,62,36,19,22,223,181,224,163,18,242,142,28,217,51,
-  15,189,14,79,124,63,159,64,250,108,232,100,11,207,220,55,197,26,244,141,
-  90,152,218,228,140,219,50,227,36,113,158,77,118,158,7,15,117,25,14,34,
-  37,215,83,66,205,124,208,187,187,207,75,107,147,121,214,154,132,138,23,86,
-  16,198,242,126,147,21,63,202,176,102,172,207,30,171,31,98,177,224,62,99,
-  234,185,227,147,214,61,35,77,104,174,105,194,81,222,140,237,21,41,198,138,
-  217,162,106,44,25,69,235,150,71,191,218,96,172,118,142,119,117,128,119,188,
-  171,163,76,138,82,16,85,34,120,160,64,148,67,2,4,160,141,124,116,40,
-  142,33,211,64,184,14,130,78,25,33,222,132,168,85,167,4,51,89,18,76,
-  174,83,202,154,221,253,250,170,92,16,184,238,18,9,170,182,65,65,102,66,
-  142,67,130,82,183,86,107,241,127,9,84,250,158,189,64,90,33,63,9,170,
-  182,107,89,214,146,164,102,123,231,216,113,111,52,85,72,32,69,210,15,19,
-  215,113,36,1,3,166,187,3,14,96,64,221,48,72,129,16,72,80,228,221,
-  236,94,197,118,60,83,32,218,236,30,179,135,166,128,25,50,137,157,238,235,
-  16,46,87,196,174,47,17,46,59,84,196,181,197,92,158,214,71,42,136,22,
-  105,144,221,56,90,226,247,128,41,62,135,193,10,122,239,243,3,112,63,184,
-  181,95,220,60,222,7,119,228,22,3,83,231,33,118,68,95,229,49,222,196,
-  211,7,84,245,14,74,25,230,17,185,232,1,168,175,109,21,11,174,253,46,
-  24,230,73,92,161,164,24,233,66,218,106,22,73,71,56,136,118,227,60,214,
-  11,42,218,82,87,36,145,29,173,240,74,69,155,106,242,195,232,46,15,142,
-  178,135,116,29,172,190,8,103,49,92,241,74,231,225,197,3,240,175,166,97,
-  56,90,17,8,21,109,81,20,133,209,46,226,80,196,19,41,46,206,222,231,
-  145,95,249,118,102,92,20,212,187,171,117,23,99,68,43,250,118,157,71,252,
-  10,243,100,180,158,130,91,174,101,84,50,99,202,32,144,255,51,69,248,228,
-  0,71,0,184,83,10,160,87,57,165,227,119,128,225,216,69,112,236,82,162,
-  104,166,196,116,9,92,192,199,122,50,24,35,93,45,29,238,149,56,65,25,
-  134,112,173,50,150,137,101,153,74,207,67,190,55,188,6,43,182,167,36,213,
-  173,199,239,58,11,238,13,134,32,243,48,69,212,44,216,198,163,72,148,209,
-  232,48,112,84,165,152,41,29,81,105,182,152,132,240,221,160,83,106,28,48,
-  131,157,210,209,33,140,25,25,57,57,69,105,134,1,243,53,77,100,67,206,
-  162,212,237,161,175,136,135,203,48,244,132,173,174,21,49,39,130,80,64,239,
-  36,122,18,86,109,20,206,34,129,194,145,123,35,197,63,51,4,10,82,9,
-  148,79,80,110,137,87,134,111,37,224,77,101,36,236,1,148,78,60,67,182,
-  164,118,224,194,197,64,66,233,181,11,115,132,29,11,91,120,108,148,150,194,
-  23,101,120,98,16,169,138,55,167,87,85,84,19,201,185,237,121,21,17,217,
-  208,164,72,51,97,139,233,108,224,185,67,144,10,61,24,210,105,94,152,241,
-  103,244,103,198,90,105,201,29,235,176,83,43,32,65,144,114,81,201,3,181,
-  36,254,92,234,94,190,189,122,245,135,232,253,41,162,153,39,191,166,39,64,
-  248,127,173,38,142,130,105,120,97,223,121,228,168,132,178,111,160,246,75,54,
-  50,13,100,192,157,227,112,202,35,6,61,50,67,125,84,123,169,251,11,20,
-  44,156,243,184,36,241,112,83,68,121,8,185,194,57,197,115,119,40,33,223,
-  59,105,71,208,57,141,191,70,72,197,118,224,240,240,123,59,26,181,68,242,
-  200,190,69,160,183,24,125,35,182,99,248,55,216,201,227,70,236,101,55,229,
-  149,55,35,151,73,52,242,65,239,37,148,80,193,168,142,93,104,124,68,175,
-  124,40,217,154,37,42,144,151,33,80,40,176,83,124,182,64,44,21,27,136,
-  136,114,115,159,117,30,138,30,187,30,234,144,193,82,94,43,100,154,251,147,
-  82,215,192,111,130,105,52,1,211,104,174,192,124,163,134,222,58,3,191,164,
-  125,173,224,184,217,119,105,184,205,179,54,45,59,10,52,252,106,255,52,235,
-  224,182,46,156,231,190,168,9,10,241,66,97,130,232,42,216,139,99,140,225,
-  141,125,219,56,66,43,142,8,119,51,200,33,64,14,183,131,28,0,228,96,
-  59,200,62,64,246,183,131,236,1,100,111,59,8,108,98,163,97,154,250,12,
-  223,136,83,209,74,109,182,26,187,71,220,221,70,128,27,72,160,193,219,219,
-  251,180,212,125,186,21,0,141,221,222,214,38,250,195,240,8,243,238,250,51,
-  159,249,210,93,131,60,72,78,99,181,109,188,172,41,202,84,249,161,35,19,
-  77,161,223,190,80,158,148,211,66,53,73,160,87,217,170,243,0,78,117,196,
-  246,230,246,157,18,97,176,89,218,165,238,133,27,0,1,233,220,53,124,65,
-  60,199,168,17,47,122,175,46,240,96,195,207,169,109,34,184,176,111,129,234,
-  133,48,83,112,34,204,110,21,95,232,28,197,195,27,234,158,239,167,77,118,
-  99,221,233,41,216,29,118,112,100,0,67,225,73,56,34,37,230,110,60,17,
-  242,198,69,224,61,36,215,53,113,3,135,96,124,246,138,4,60,8,201,234,
-  69,179,32,128,29,166,177,97,237,244,254,208,250,34,134,118,0,250,96,108,
-  54,156,136,193,76,145,121,3,148,69,9,73,34,110,116,39,12,31,90,1,
-  238,71,100,177,226,89,196,164,48,108,209,246,185,29,15,39,38,219,200,133,
-  74,148,192,11,53,244,174,133,68,70,97,18,137,170,40,128,164,249,41,212,
-  14,168,216,128,65,78,78,17,77,178,190,208,122,149,128,161,163,158,131,107,
-  199,181,199,200,73,99,119,168,32,125,52,250,78,248,51,146,127,108,223,145,
-  7,255,44,163,208,18,103,51,142,192,68,239,143,29,221,122,56,178,144,198,
-  146,130,84,230,98,14,23,199,2,35,101,85,74,71,0,2,121,15,164,76,
-  197,156,70,85,197,224,142,159,148,13,63,160,35,27,36,75,80,252,156,135,
-  79,162,191,9,242,174,156,227,101,31,58,8,111,181,243,85,58,60,229,40,
-  85,200,128,167,7,68,25,30,87,116,160,126,74,197,19,196,25,227,73,75,
-  143,36,137,24,228,197,85,99,175,222,52,106,148,13,184,190,169,222,65,24,
-  198,67,152,231,231,248,22,195,16,222,193,9,231,1,245,38,85,100,230,117,
-  68,185,94,111,213,235,85,81,223,211,95,77,253,213,192,87,166,226,140,205,
-  143,194,57,170,213,211,29,166,94,53,27,192,188,155,214,218,55,208,228,43,
-  124,30,239,106,160,76,18,58,242,213,56,147,193,154,177,64,206,241,129,241,
-  245,219,25,26,65,42,143,100,65,34,14,67,182,35,70,82,58,28,111,175,
-  141,167,243,224,198,141,194,192,39,175,11,93,67,26,238,250,164,175,103,58,
-  194,56,179,3,219,177,197,213,135,183,207,107,23,175,171,130,66,16,40,19,
-  20,12,193,30,34,17,212,160,159,195,192,218,121,161,253,142,56,251,240,225,
-  185,112,21,52,50,242,160,103,36,132,75,23,128,53,173,48,26,92,156,159,
-  157,157,61,134,5,130,188,223,218,215,55,174,71,228,144,104,136,153,146,10,
-  234,37,135,54,126,17,10,26,224,170,29,4,182,9,170,187,68,177,196,219,
-  1,197,162,230,133,98,151,236,221,181,17,21,65,79,104,30,68,132,158,147,
-  132,162,240,216,4,19,201,79,144,30,84,76,135,169,59,252,206,244,182,116,
-  140,2,175,228,227,191,176,8,51,105,209,156,146,119,185,37,93,12,51,140,
-  81,196,145,199,6,219,15,73,229,208,28,207,129,48,86,116,50,79,235,3,
-  1,61,52,99,30,73,216,169,60,254,47,84,84,140,114,70,131,2,35,44,
-  143,192,165,15,168,240,165,180,167,48,35,81,8,51,82,80,47,189,126,64,
-  94,185,49,158,202,122,201,185,138,131,18,79,168,240,168,128,217,78,83,9,
-  61,254,185,70,2,202,133,254,153,144,255,233,67,35,254,172,167,206,178,48,
-  248,192,60,60,10,6,106,218,78,107,55,102,128,205,13,3,36,45,193,8,
-  214,86,32,209,235,165,53,216,88,65,64,150,101,91,5,4,144,171,128,251,
-  22,89,225,124,141,122,177,131,77,36,232,33,42,71,184,239,88,62,100,17,
-  90,227,161,53,180,119,227,16,241,255,110,70,177,213,174,19,14,119,213,60,
-  28,212,110,125,175,111,26,210,39,100,107,168,110,244,72,202,215,160,59,226,
-  246,130,204,92,77,3,60,200,174,245,50,246,44,153,28,41,178,104,111,122,
-  103,20,160,96,112,75,31,14,213,105,139,127,95,190,122,251,148,38,124,110,
-  100,198,131,193,246,156,190,56,131,100,28,50,50,236,95,68,19,145,116,56,
-  241,171,58,154,104,90,77,49,251,5,65,193,142,158,112,22,8,173,194,120,
-  66,54,133,168,92,126,184,176,196,107,118,160,28,247,192,87,121,250,41,244,
-  98,50,100,29,168,33,217,30,75,252,110,74,212,132,204,29,44,16,124,49,
-  7,171,182,83,221,49,193,4,153,70,157,160,71,82,65,126,33,25,76,132,
-  22,74,155,0,159,194,11,88,53,176,76,61,18,105,195,104,137,43,73,137,
-  57,51,80,101,147,183,108,161,24,209,164,245,14,153,117,18,141,169,209,141,
-  140,129,123,192,160,66,90,2,125,123,103,207,77,11,203,245,218,210,83,225,
-  29,162,60,132,195,141,134,113,87,149,130,33,199,36,86,38,64,120,218,163,
-  110,102,61,14,40,172,223,168,241,60,229,181,77,227,115,115,98,122,72,65,
-  34,137,130,124,101,64,197,60,189,139,184,88,1,167,252,200,145,227,246,89,
-  97,35,216,20,228,27,161,167,105,234,86,195,180,167,214,76,90,68,41,217,
-  198,6,189,165,26,183,180,135,222,175,91,136,144,89,252,122,123,38,80,56,
-  202,172,161,48,166,57,85,177,71,252,21,182,138,161,55,52,235,32,105,214,
-  65,210,172,195,109,205,122,201,21,111,105,23,3,228,26,198,92,98,56,41,
-  173,92,155,236,211,67,212,212,161,152,149,122,158,167,223,76,84,178,76,144,
-  178,109,214,160,69,10,153,76,195,53,154,153,73,184,108,154,189,222,248,213,
-  6,103,3,245,165,177,227,42,223,164,115,118,122,108,162,87,35,152,4,133,
-  33,174,131,32,19,174,232,252,130,235,55,195,57,12,5,98,111,239,142,118,
-  237,160,113,73,38,70,185,15,51,167,172,213,104,209,24,246,245,14,160,150,
-  229,116,139,226,125,216,60,173,42,156,41,177,182,164,125,177,147,31,107,23,
-  118,132,64,33,71,34,107,150,125,122,189,1,247,10,76,175,12,84,178,43,
-  138,138,69,57,114,105,99,138,96,63,91,201,104,194,186,251,232,50,15,130,
-  84,87,65,46,248,201,162,74,146,60,150,53,77,9,96,208,144,225,155,70,
-  72,94,148,201,192,19,51,6,171,234,82,238,107,9,234,15,14,50,168,0,
-  78,114,231,226,252,244,234,253,187,243,23,58,222,66,33,103,141,166,83,34,
-  89,67,250,152,88,100,238,29,90,142,20,200,6,246,171,226,168,42,26,123,
-  248,31,223,205,38,254,127,138,161,135,239,189,167,176,227,118,112,199,142,99,
-  71,34,130,128,1,71,222,2,146,48,228,236,77,92,29,219,33,214,246,194,
-  49,76,52,124,143,158,225,115,44,241,111,154,186,53,250,64,64,163,25,218,
-  135,46,83,148,69,195,38,196,30,101,187,104,190,220,153,71,110,108,242,81,
-  74,99,218,57,95,71,42,166,117,142,64,60,123,12,39,36,6,238,88,124,
-  154,249,83,171,80,210,203,254,161,218,149,168,83,149,92,191,51,139,239,208,
-  210,3,161,187,64,203,145,55,116,176,208,61,155,115,78,194,225,201,3,118,
-  60,110,176,99,199,156,64,80,198,238,85,5,229,237,119,186,97,169,78,83,
-  190,78,238,81,39,121,234,159,25,101,250,115,240,13,71,23,67,222,119,73,
-  28,44,105,40,80,93,196,190,150,225,14,149,251,174,227,120,137,132,169,224,
-  221,25,101,42,228,48,65,215,119,149,226,148,128,230,201,73,74,90,92,74,
-  124,10,7,156,158,216,172,25,38,12,160,126,81,201,156,185,179,99,194,129,
-  81,20,250,137,243,38,129,232,216,160,202,4,109,18,130,63,39,166,117,7,
-  22,11,246,185,164,201,201,116,216,101,115,77,51,17,65,129,2,168,97,40,
-  34,171,87,238,56,96,13,228,6,34,195,119,227,153,195,26,75,147,165,59,
-  110,160,72,52,150,248,64,65,203,0,41,215,53,164,84,77,114,101,206,129,
-  108,146,64,128,124,69,101,101,157,33,70,162,172,183,180,162,145,152,143,136,
-  252,147,35,138,30,196,145,22,140,19,133,83,214,186,58,67,179,230,3,168,
-  118,100,9,54,229,182,8,228,24,241,31,244,85,15,51,61,10,129,192,83,
-  35,144,179,181,49,30,164,100,245,155,35,194,149,25,143,194,101,212,179,115,
-  1,44,218,193,132,96,85,236,138,124,34,227,156,109,72,224,174,206,94,255,
-  134,158,150,255,204,100,48,204,103,91,206,203,207,197,56,151,161,231,241,12,
-  127,22,152,10,183,36,99,72,54,124,8,51,143,67,111,30,154,205,81,7,
-  231,177,223,161,228,161,216,100,49,242,11,196,206,7,42,122,200,194,109,102,
-  22,102,109,149,154,152,120,200,34,53,45,1,152,137,255,21,25,227,69,49,
-  202,171,171,119,121,208,87,42,218,200,161,35,120,70,98,165,211,127,161,178,
-  135,229,157,122,91,7,28,187,222,215,145,166,195,24,147,60,205,136,124,0,
-  186,106,94,30,27,79,194,138,21,208,2,69,186,48,154,16,122,112,174,163,
-  98,101,210,155,149,121,165,100,15,68,102,7,73,189,180,226,107,47,1,141,
-  97,152,247,182,13,75,152,114,158,224,100,87,187,193,87,23,184,249,166,37,
-  94,24,19,197,94,94,79,127,137,90,87,212,15,240,99,147,211,135,57,203,
-  211,217,131,33,31,210,162,32,188,8,229,101,236,184,109,136,225,198,141,239,
-  54,80,161,30,206,17,217,183,4,212,0,214,207,27,213,244,2,71,33,94,
-  126,150,66,135,28,146,155,48,200,205,247,109,98,158,54,17,228,195,37,148,
-  240,234,103,54,157,206,108,48,137,47,163,112,125,242,110,213,171,34,130,104,
-  104,103,217,210,83,199,20,218,209,26,88,160,44,209,204,230,169,212,79,163,
-  100,249,150,253,41,91,117,138,21,105,83,166,210,30,254,252,234,114,175,153,
-  58,14,41,119,50,254,132,221,134,54,191,186,116,12,111,151,152,225,72,38,
-  155,24,104,69,29,238,133,230,230,41,192,185,147,108,170,35,153,211,215,227,
-  93,179,115,71,13,17,174,197,221,29,90,3,136,69,239,207,206,95,59,127,
-  149,204,76,225,174,120,127,85,170,150,78,125,248,205,161,189,123,21,247,127,
-  13,39,129,66,209,155,171,222,94,107,175,254,230,69,175,122,177,103,53,173,
-  122,245,162,209,176,26,86,189,244,119,117,35,254,75,219,115,71,72,50,81,
-  114,213,219,63,253,38,220,94,24,133,65,28,162,228,252,170,119,112,254,77,
-  184,31,220,32,112,167,114,140,162,179,171,222,225,217,55,33,191,147,24,153,
-  182,65,221,6,120,238,248,196,97,128,162,139,171,222,211,139,111,170,229,119,
-  59,128,6,211,22,169,106,233,242,170,119,116,249,109,13,164,189,117,147,48,
-  82,210,84,190,13,248,63,146,86,83,175,3,119,36,191,139,213,87,255,32,
-  30,112,227,239,234,137,55,114,222,255,79,24,93,127,23,242,217,4,159,227,
-  240,187,122,241,133,12,180,112,191,189,189,151,147,80,6,238,237,3,36,251,
-  58,84,253,83,196,137,158,84,223,213,141,167,193,16,157,72,219,115,80,246,
-  219,85,239,217,233,111,15,194,191,180,135,238,200,29,238,190,132,243,243,102,
-  222,12,69,47,175,122,13,3,251,26,81,92,32,76,29,153,218,46,228,173,
-  59,12,251,103,48,213,57,237,222,4,223,115,63,205,108,30,9,219,90,182,
-  9,251,223,51,196,171,190,237,217,15,170,235,18,21,249,182,209,146,237,160,
-  207,195,113,24,83,193,113,173,126,208,253,10,240,107,215,127,40,232,153,29,
-  217,67,91,105,232,253,238,254,118,232,43,59,136,93,173,156,26,28,159,123,
-  221,234,197,51,72,230,112,183,185,95,189,216,55,191,182,211,57,141,198,200,
-  2,96,112,118,159,35,88,37,125,114,35,105,152,216,235,238,125,141,137,176,
-  127,137,112,40,124,32,252,5,29,254,161,69,214,135,34,188,182,65,255,243,
-  3,69,242,210,190,177,19,195,121,176,28,173,187,169,194,236,54,190,46,211,
-  176,255,34,164,181,219,208,56,141,175,168,205,12,142,52,236,191,131,94,231,
-  224,207,103,200,118,104,84,233,31,24,168,129,195,134,250,223,23,189,250,243,
-  43,102,237,128,24,2,107,117,250,85,140,246,130,118,62,37,104,175,30,140,
-  246,218,85,3,174,237,195,121,175,254,225,252,193,120,23,182,67,83,100,16,
-  224,121,175,214,56,91,34,38,104,187,123,197,136,151,118,228,170,239,192,123,
-  30,205,144,93,121,223,131,122,234,211,182,31,199,246,191,167,90,25,105,177,
-  126,43,226,159,51,244,250,228,59,16,223,133,190,252,14,180,223,93,25,104,
-  141,254,214,14,129,81,159,125,79,141,31,236,72,217,243,239,64,188,138,195,
-  225,245,36,244,190,167,63,222,42,182,32,223,138,118,134,143,96,2,239,245,
-  61,93,249,18,106,231,6,215,46,149,0,181,121,158,25,38,123,41,242,134,
-  225,124,74,97,180,250,46,212,231,51,58,39,137,80,249,187,176,127,187,115,
-  111,190,11,241,21,237,219,27,204,60,50,165,79,96,119,107,27,196,114,17,
-  170,97,56,231,208,227,183,53,152,211,216,35,175,51,68,136,122,119,253,201,
-  190,113,175,141,105,210,112,167,35,178,137,136,17,46,244,44,218,185,205,173,
-  212,197,112,111,116,110,3,81,167,173,121,168,119,235,248,108,116,171,100,160,
-  127,221,59,60,216,109,30,60,132,206,107,56,61,18,253,135,83,116,248,195,
-  42,118,163,48,47,180,125,136,234,96,55,209,145,253,212,73,110,39,132,84,
-  4,89,146,84,131,89,68,145,253,21,204,125,173,249,16,196,55,196,193,128,
-  85,13,76,239,61,4,229,116,56,140,236,111,144,238,169,55,118,101,148,26,
-  210,237,40,202,69,99,36,108,175,237,73,26,175,175,168,33,175,180,195,220,
-  39,113,28,230,253,196,54,58,207,165,27,205,10,149,121,57,4,31,64,230,
-  157,123,103,59,147,85,237,220,134,1,223,104,187,26,97,191,91,219,255,58,
-  66,79,78,34,59,48,85,236,213,81,9,242,201,7,52,208,30,79,28,219,
-  89,99,13,239,18,144,223,40,114,155,16,51,151,191,245,106,7,5,0,161,
-  119,109,115,204,72,162,62,88,214,155,35,18,79,104,50,111,166,107,58,216,
-  63,232,2,114,191,128,218,139,137,125,109,6,209,97,183,118,184,14,240,31,
-  27,241,139,105,233,33,181,244,176,176,198,231,0,187,14,175,53,220,211,110,
-  237,233,58,200,175,168,41,98,198,63,188,122,94,4,112,133,80,201,158,134,
-  145,212,84,142,186,181,163,130,166,205,16,134,247,95,207,252,233,44,218,6,
-  119,97,7,174,103,226,253,162,247,72,55,198,253,223,240,65,249,198,111,133,
-  32,61,27,121,183,171,99,192,162,247,87,52,175,62,177,183,65,200,144,205,
-  36,210,161,218,179,130,10,194,235,59,178,38,191,22,191,126,239,217,176,179,
-  54,58,123,107,75,79,61,223,230,44,136,122,186,91,164,50,61,91,77,174,
-  17,153,111,131,249,205,78,45,250,62,117,243,126,97,55,211,49,44,127,16,
-  26,66,4,87,172,128,191,123,182,227,222,132,42,54,42,209,0,100,163,0,
-  238,63,18,186,140,240,55,48,118,112,35,123,111,66,80,115,7,110,164,214,
-  116,236,237,80,162,175,25,114,166,226,200,246,0,126,137,80,154,44,192,233,
-  135,101,199,20,193,189,176,163,57,71,111,167,212,131,207,210,182,20,193,158,
-  58,210,179,145,111,100,161,79,57,53,128,105,106,80,148,176,207,137,193,222,
-  102,18,207,17,218,14,236,128,73,192,186,165,34,41,130,189,186,115,2,121,
-  183,132,60,61,255,166,170,46,164,55,8,103,81,182,174,111,164,240,50,28,
-  96,188,126,35,122,146,205,159,206,134,215,180,72,76,179,109,127,18,122,243,
-  205,159,132,254,76,199,83,95,193,62,155,192,128,113,56,14,213,105,146,245,
-  106,52,97,190,240,176,135,7,67,101,151,138,82,82,169,117,91,167,246,139,
-  251,201,53,164,136,208,38,48,36,249,28,112,78,10,59,38,129,186,12,163,
-  184,127,1,35,165,6,119,107,170,189,14,222,179,39,110,204,181,3,168,187,
-  25,238,116,234,106,51,220,128,91,104,108,20,76,15,6,11,246,96,58,91,
-  131,125,223,59,67,89,250,137,138,254,110,155,105,209,159,58,110,167,235,132,
-  195,25,109,173,180,198,50,62,135,171,198,207,231,119,175,156,178,91,73,192,
-  164,26,118,84,167,123,21,99,56,142,203,170,98,69,52,67,61,148,229,221,
-  191,30,29,119,75,127,239,142,171,195,78,183,124,95,122,84,106,149,30,217,
-  254,180,77,76,208,111,47,166,159,93,250,57,166,159,143,75,143,241,243,159,
-  89,136,135,197,95,195,191,43,105,29,8,176,59,62,42,241,213,113,163,94,
-  175,159,248,234,73,73,248,74,208,228,67,11,133,207,234,84,122,129,222,183,
-  120,45,179,236,171,93,2,172,0,108,9,133,48,75,30,174,64,29,214,13,
-  24,18,110,13,72,165,123,214,161,60,172,88,113,248,139,123,43,157,114,131,
-  0,38,252,58,225,200,153,69,212,106,170,250,132,152,81,165,22,42,216,207,
-  115,65,228,13,109,208,5,89,212,182,74,21,20,61,25,139,222,249,197,101,
-  255,226,244,143,206,65,3,25,242,239,252,115,175,126,208,208,111,105,129,233,
-  117,104,59,210,233,240,14,190,234,96,166,238,204,207,145,237,122,16,190,180,
-  175,59,245,246,206,104,22,232,21,25,90,127,61,11,131,160,60,244,84,213,
-  87,227,202,189,102,124,216,249,169,172,15,121,86,218,238,168,252,131,126,101,
-  233,3,159,157,56,154,201,118,36,105,95,120,123,49,180,120,218,255,13,95,
-  159,66,40,162,244,4,212,218,67,139,118,30,158,153,91,84,64,160,157,226,
-  51,75,237,197,206,146,143,145,235,121,189,207,229,164,122,69,213,211,113,168,
-  10,93,3,33,198,157,96,230,121,213,80,127,183,119,68,239,79,11,141,61,
-  71,44,83,46,255,53,142,166,85,186,188,165,74,103,134,254,174,116,186,247,
-  224,24,133,63,116,58,96,122,220,193,207,54,80,83,29,29,66,10,177,52,
-  106,90,46,133,211,152,150,182,169,174,112,108,241,6,23,70,81,150,61,69,
-  218,230,156,209,205,13,229,112,92,1,195,66,104,254,194,78,32,231,226,45,
-  239,233,47,167,117,51,129,28,18,112,160,157,34,79,42,131,90,58,131,65,
-  12,125,62,237,4,37,31,242,83,169,162,113,194,64,175,173,119,202,166,77,
-  202,226,245,102,180,43,133,100,49,149,42,250,69,199,0,180,23,192,79,222,
-  132,1,111,10,210,68,52,247,55,157,28,154,133,49,233,151,233,16,60,189,
-  244,59,36,92,23,122,25,119,186,241,95,205,191,59,157,206,77,165,109,72,
-  119,252,19,31,101,173,132,1,84,149,237,198,248,54,40,199,21,226,245,135,
-  184,162,21,228,113,110,179,16,239,67,11,104,115,196,93,186,247,255,49,184,
-  213,176,226,227,79,247,48,20,101,244,145,239,84,22,199,131,168,187,142,157,
-  128,140,104,111,71,101,241,211,189,249,121,82,18,95,4,172,68,9,69,176,
-  4,128,192,103,223,7,8,202,9,138,142,38,244,225,35,165,90,232,221,34,
-  10,47,104,125,141,94,186,42,234,207,240,98,150,28,53,248,152,107,24,31,
-  250,118,63,203,114,84,185,55,188,18,23,81,198,142,253,119,249,221,249,213,
-  251,215,189,150,184,60,189,186,178,126,254,66,95,149,221,177,95,93,17,65,
-  128,54,36,59,9,31,87,118,68,17,137,95,78,95,189,6,9,250,42,32,
-  49,64,148,159,165,145,161,240,225,244,221,155,117,4,58,167,94,234,210,187,
-  20,39,215,188,72,210,193,200,178,83,185,103,197,161,245,128,74,110,248,150,
-  110,74,79,28,139,14,160,0,92,107,151,62,101,158,7,115,44,90,34,183,
-  248,248,228,73,246,193,82,83,207,197,96,19,165,202,95,13,168,79,114,54,
-  189,100,52,85,159,246,222,76,236,203,151,146,94,245,139,69,121,110,235,237,
-  63,180,98,248,166,119,89,73,104,244,62,175,16,128,54,25,26,241,231,62,
-  175,189,202,133,40,167,133,142,138,251,116,134,168,79,56,139,202,71,144,209,
-  67,96,142,170,231,240,136,134,46,31,9,175,88,46,50,234,232,101,239,226,
-  117,103,206,183,1,240,206,122,88,132,147,143,107,221,155,190,78,142,173,144,
-  2,146,190,204,45,165,92,199,104,228,220,138,240,180,224,51,84,75,0,119,
-  106,94,235,199,9,194,220,202,66,11,225,35,106,107,125,92,215,4,199,85,
-  15,169,145,143,124,160,245,179,8,165,244,208,215,99,3,250,28,221,209,30,
-  160,159,238,51,94,9,220,81,121,63,241,145,11,65,195,197,51,123,49,84,
-  24,180,210,26,168,176,175,11,89,150,149,197,71,35,58,58,27,95,208,39,
-  65,60,181,244,193,90,170,95,239,143,210,140,233,119,201,65,99,98,48,33,
-  165,79,203,103,187,225,99,239,15,150,98,124,219,119,6,62,203,145,36,244,
-  164,156,20,81,159,35,161,123,244,104,165,224,135,78,82,112,242,81,20,140,
-  147,178,62,58,134,65,133,112,76,101,234,48,248,139,74,98,35,96,109,42,
-  203,42,233,210,41,87,58,39,165,82,235,177,88,239,166,50,239,156,210,48,
-  149,204,248,23,79,62,102,186,107,170,150,74,137,214,39,175,245,166,36,98,
-  101,217,219,42,233,61,218,185,197,250,164,127,115,177,105,2,70,140,121,71,
-  5,125,93,144,10,149,151,254,179,50,213,242,231,14,165,219,6,78,140,65,
-  94,41,134,50,172,219,229,178,54,187,43,160,125,50,194,234,103,163,66,212,
-  76,211,253,244,142,119,38,44,248,94,3,149,202,148,148,188,200,122,209,185,
-  24,218,151,144,119,28,38,94,152,130,115,62,92,85,13,131,142,154,90,118,
-  228,75,71,55,82,223,118,81,201,70,41,250,202,139,210,147,114,24,156,208,
-  128,109,113,11,42,121,248,172,214,2,174,12,170,188,35,228,164,196,95,136,
-  228,166,86,186,181,226,164,148,254,4,53,230,4,38,170,84,105,149,50,199,
-  186,18,67,165,239,95,88,53,118,36,21,190,172,161,15,205,119,181,101,73,
-  164,165,203,167,83,191,91,63,41,61,49,78,110,229,85,26,49,54,33,104,
-  60,147,165,43,175,192,252,92,183,234,71,135,251,149,28,172,218,117,236,187,
-  138,224,67,121,217,81,168,177,72,210,60,14,217,248,248,124,173,4,221,186,
-  34,2,41,29,37,14,56,36,14,71,186,19,243,76,105,84,248,229,242,132,
-  246,118,195,131,20,211,126,82,170,112,147,210,161,206,151,77,100,213,178,188,
-  123,121,250,230,213,217,151,231,239,222,126,120,243,246,125,239,11,111,245,112,
-  194,241,174,107,209,110,14,80,101,205,54,86,168,178,110,150,181,203,52,202,
-  156,131,93,164,131,249,227,166,96,99,19,70,58,120,121,159,205,143,212,122,
-  250,149,232,245,23,49,155,166,18,157,77,201,233,36,146,124,82,206,130,118,
-  27,39,143,11,13,145,54,141,145,100,250,236,228,239,244,142,153,250,222,250,
-  49,62,58,5,145,218,21,178,76,70,156,116,25,71,206,110,142,34,41,5,
-  43,199,68,218,211,62,61,194,198,55,247,179,73,199,66,92,63,103,123,31,
-  241,193,86,190,106,43,131,99,202,55,162,233,243,175,82,171,84,130,4,77,
-  41,68,72,4,146,165,44,142,197,81,227,89,83,156,136,66,83,58,138,236,
-  49,133,239,25,75,42,90,226,241,227,202,210,137,223,146,23,191,253,242,229,
-  222,68,195,230,28,91,86,18,63,204,111,45,115,10,243,164,32,78,77,46,
-  112,34,223,152,236,119,77,106,163,209,192,232,104,98,223,142,105,95,103,92,
-  76,5,118,139,143,132,137,20,42,107,194,136,14,200,208,0,233,155,77,172,
-  40,42,10,42,140,131,184,181,204,225,35,136,14,118,253,214,34,162,253,225,
-  194,108,178,205,88,81,246,75,183,218,20,203,40,10,163,85,111,199,162,100,
-  143,110,88,75,93,122,22,43,51,64,180,183,43,140,65,130,48,217,131,203,
-  76,101,42,45,137,26,134,254,58,89,26,241,105,172,173,123,136,206,10,230,
-  2,173,91,43,28,168,62,13,28,26,209,134,70,82,84,225,230,145,127,185,
-  14,48,12,184,197,104,98,217,132,56,26,144,221,15,68,21,122,14,51,150,
-  150,117,241,224,219,183,250,225,164,72,201,174,122,167,175,207,51,227,9,33,
-  34,215,177,234,220,181,247,227,19,157,1,115,82,53,71,31,56,98,133,89,
-  92,113,247,136,126,141,39,48,7,26,115,150,14,108,205,169,180,79,169,121,
-  127,136,236,139,114,222,47,95,214,203,233,50,19,120,25,80,39,225,20,106,
-  158,57,196,21,138,233,76,77,86,213,174,72,197,86,106,89,209,42,209,225,
-  195,5,25,48,60,178,61,211,170,166,203,6,178,31,200,113,161,178,149,233,
-  128,46,109,166,206,106,110,213,28,23,179,105,63,124,186,83,155,195,116,2,
-  0,173,62,111,246,62,41,85,245,174,111,242,172,220,31,89,197,52,18,213,
-  71,60,215,6,121,126,148,162,3,88,0,169,166,176,90,154,247,208,136,144,
-  85,6,223,203,166,49,196,36,142,193,48,162,179,19,50,250,47,123,189,75,
-  177,212,246,244,229,34,29,40,140,201,117,135,215,140,194,131,109,28,134,142,
-  200,87,29,94,231,106,133,134,125,41,144,94,192,246,84,205,134,67,72,49,
-  13,245,31,47,171,162,57,6,8,231,100,13,157,58,87,27,161,127,102,114,
-  182,68,109,17,83,1,194,16,29,254,27,150,168,160,239,106,175,159,200,85,
-  239,49,93,137,229,211,200,19,195,80,11,143,99,207,240,218,148,241,37,16,
-  210,161,50,146,142,160,73,40,253,138,133,69,143,106,25,226,78,233,86,222,
-  12,12,63,27,32,188,134,217,243,164,126,195,63,251,250,116,51,191,35,207,
-  33,212,181,59,53,212,201,145,208,99,26,233,234,35,184,121,246,19,64,115,
-  170,132,140,135,254,73,46,43,255,178,216,207,149,19,95,165,225,205,211,54,
-  20,109,65,208,218,90,215,220,173,144,169,138,11,54,58,200,86,41,117,36,
-  24,199,105,206,75,167,2,115,246,195,140,26,29,170,22,13,241,44,0,141,
-  223,19,58,224,168,207,191,96,84,233,216,118,33,86,224,104,83,238,98,183,
-  160,16,226,255,175,149,98,62,154,212,87,11,101,26,91,84,37,106,106,81,
-  64,152,125,49,124,82,50,230,38,117,12,232,218,101,142,101,128,233,68,20,
-  44,246,122,211,232,197,146,111,13,182,80,91,40,197,212,97,38,220,46,160,
-  103,251,3,151,174,11,72,73,26,248,53,171,88,64,154,13,224,250,8,86,
-  179,65,141,238,166,40,50,110,162,156,24,55,138,134,69,57,181,132,149,173,
-  226,8,175,89,115,181,93,54,101,100,149,197,46,158,147,249,226,133,40,255,
-  15,199,97,90,220,55,58,165,207,101,1,191,103,206,234,26,71,103,242,210,
-  4,109,58,247,251,147,207,43,168,148,213,93,191,252,188,172,155,160,6,46,
-  134,101,13,159,73,24,146,163,112,156,123,234,207,237,32,102,48,246,222,69,
-  81,48,65,72,103,141,19,198,44,102,167,74,135,150,17,144,140,102,138,252,
-  77,188,154,176,183,10,230,211,8,227,205,219,158,56,237,245,78,207,94,158,
-  191,48,215,56,76,221,64,159,153,67,16,44,201,155,242,190,245,128,239,9,
-  243,60,75,60,102,37,127,252,75,114,134,70,220,138,230,127,147,0,132,188,
-  29,114,138,68,84,94,159,191,56,75,46,20,9,35,62,17,240,120,41,22,
-  55,248,242,229,105,229,201,99,170,104,22,216,55,48,121,20,120,90,107,147,
-  4,250,120,236,82,216,250,57,159,20,102,94,36,138,154,166,251,124,253,72,
-  46,23,200,201,225,167,251,92,66,188,72,130,78,100,186,43,169,79,65,4,
-  244,133,207,42,154,44,18,24,201,83,127,178,16,147,124,160,103,110,218,203,
-  155,99,160,184,84,76,89,111,242,123,33,196,95,203,167,254,68,222,46,254,
-  254,104,226,39,29,230,15,16,229,15,102,74,211,165,99,78,121,162,3,107,
-  40,251,83,48,161,50,38,213,0,191,252,188,6,204,83,196,147,207,221,220,
-  250,76,90,76,43,49,64,106,241,84,164,159,92,176,184,180,198,250,16,212,
-  42,77,186,58,175,207,135,89,158,148,205,211,152,146,33,197,17,193,240,110,
-  8,175,134,2,8,45,247,118,33,124,149,9,108,244,97,169,108,215,209,92,
-  251,128,195,135,74,155,0,248,60,84,49,0,103,22,26,74,31,123,218,0,
-  198,199,164,146,10,249,104,83,22,112,64,74,224,113,232,157,204,11,101,138,
-  182,205,9,25,176,236,84,208,150,233,158,116,141,160,37,134,246,52,102,33,
-  243,225,17,62,145,72,77,81,153,243,32,78,40,245,232,76,110,90,74,167,
-  134,184,143,233,124,213,74,212,66,23,165,209,221,43,90,77,253,225,172,79,
-  119,169,112,136,161,227,167,68,127,103,17,79,197,45,232,190,67,190,73,168,
-  149,121,163,79,115,233,105,99,170,137,14,239,228,194,206,1,175,41,208,161,
-  69,216,137,181,212,144,77,206,217,185,190,83,49,154,77,99,110,67,10,221,
-  210,151,51,65,45,220,64,207,92,19,19,250,230,4,219,67,126,61,174,100,
-  67,121,83,87,100,251,39,235,139,13,175,222,157,94,212,148,61,146,250,32,
-  18,31,44,91,162,22,77,181,37,112,124,251,33,93,189,151,242,37,232,92,
-  47,223,38,222,210,119,185,209,159,17,160,101,78,158,144,7,141,137,62,107,
-  167,16,200,223,209,117,46,116,18,117,25,111,66,86,233,2,227,64,207,158,
-  1,191,26,135,113,103,8,217,37,87,146,60,25,90,201,197,79,248,201,70,
-  68,223,22,133,39,186,101,170,207,3,146,110,153,2,65,150,190,62,234,150,
-  11,132,64,180,72,230,143,91,235,18,50,33,244,199,37,7,232,232,44,67,
-  164,28,9,71,252,42,121,224,112,119,121,155,21,191,203,240,187,72,226,61,
-  10,253,147,219,177,8,38,223,138,69,54,107,103,232,21,179,60,36,51,54,
-  128,184,134,82,157,232,78,74,77,52,148,104,236,185,136,11,101,230,194,159,
-  60,74,158,190,150,76,65,126,81,163,163,173,97,192,17,138,62,80,40,204,
-  165,68,120,49,143,66,74,37,233,54,196,204,124,83,110,186,105,97,140,112,
-  144,239,137,183,3,98,202,194,216,163,116,161,188,236,247,10,18,240,105,185,
-  252,215,117,245,134,150,109,63,38,7,26,127,186,191,94,174,104,245,119,199,
-  85,90,54,90,36,103,27,241,250,102,177,60,197,248,177,98,125,10,221,160,
-  108,194,162,148,8,45,224,136,100,162,60,131,155,46,222,168,12,145,28,18,
-  79,181,231,48,178,83,238,153,154,215,235,51,19,240,57,228,100,82,126,67,
-  109,217,137,250,60,94,118,194,62,83,107,234,250,120,133,12,9,199,210,23,
-  206,212,221,155,112,222,137,45,115,249,155,153,208,78,142,73,86,172,100,70,
-  139,22,128,205,233,199,149,194,36,207,203,21,242,241,198,149,50,109,239,210,
-  34,83,183,241,239,124,62,112,197,17,106,0,242,28,177,69,75,230,139,228,
-  138,58,203,178,146,165,39,31,29,9,255,80,205,120,95,60,254,12,229,225,
-  191,217,224,208,106,148,6,180,111,203,141,106,108,193,242,232,155,120,124,85,
-  169,84,22,255,34,143,9,30,220,81,89,87,82,209,243,201,249,28,41,93,
-  204,141,45,189,198,83,209,40,63,44,55,80,84,238,129,24,240,234,149,94,
-  247,206,46,90,145,35,229,123,109,243,47,151,171,86,237,252,178,124,186,8,
-  217,94,89,148,47,87,18,251,197,190,61,7,157,172,78,18,142,190,7,52,
-  93,229,207,121,32,122,175,76,92,199,103,93,209,25,128,48,211,154,134,190,
-  185,255,45,7,177,156,126,230,75,20,210,173,37,203,28,2,121,217,237,151,
-  47,201,139,182,217,111,146,38,17,250,181,46,37,46,204,61,57,249,110,79,
-  177,169,233,116,69,14,13,250,219,162,226,180,245,166,118,126,197,235,50,249,
-  87,58,180,53,13,211,87,187,172,64,228,242,186,149,220,173,213,172,27,84,
-  190,35,43,193,44,211,92,241,163,71,244,153,206,175,126,249,82,162,27,222,
-  74,73,85,124,47,105,130,96,54,50,37,43,131,28,92,153,43,41,215,64,
-  204,146,30,253,193,135,116,131,14,111,161,89,236,44,118,118,108,94,213,74,
-  151,226,41,4,44,243,22,10,26,49,102,19,69,155,119,242,48,206,14,252,
-  238,221,61,88,162,141,49,17,241,70,207,81,199,166,101,113,61,65,80,46,
-  237,218,83,119,87,241,165,235,165,234,253,208,70,183,83,212,90,163,219,150,
-  100,105,1,83,61,164,5,148,114,32,227,243,40,170,220,211,2,213,252,94,
-  209,221,77,128,67,64,187,224,205,46,52,38,34,43,188,174,228,222,211,220,
-  77,169,74,51,93,173,200,210,149,208,20,59,51,244,41,97,232,147,97,40,
-  178,62,33,111,40,167,53,242,164,206,122,157,92,108,106,53,155,17,62,65,
-  94,217,77,75,233,86,165,82,169,74,83,162,52,118,12,81,73,251,22,196,
-  18,250,201,147,182,230,126,89,212,237,52,25,136,74,229,163,71,210,226,138,
-  59,157,14,55,183,178,36,142,104,140,246,233,233,83,198,17,95,188,194,39,
-  138,249,207,63,89,226,85,172,47,214,51,17,33,37,115,250,190,82,242,26,
-  83,186,200,228,237,212,92,58,241,254,234,121,18,175,249,24,240,116,209,21,
-  146,198,70,227,160,89,175,183,192,71,114,75,96,20,207,166,98,64,27,246,
-  35,113,45,233,50,17,88,37,73,231,184,198,213,76,160,203,213,210,160,165,
-  106,107,32,9,139,239,185,215,210,211,247,83,30,32,131,55,215,20,80,232,
-  200,247,190,240,149,31,123,214,30,94,81,72,167,44,206,38,4,7,113,235,
-  130,224,126,93,147,196,11,110,184,217,160,131,200,130,103,61,75,79,164,69,
-  10,128,132,136,118,97,100,212,109,123,21,186,155,55,213,193,87,34,211,149,
-  40,176,103,1,95,137,168,175,41,161,158,224,193,44,126,189,122,251,198,18,
-  103,100,196,210,139,196,116,56,156,171,119,141,190,57,209,63,155,58,20,133,
-  145,86,232,85,29,62,124,14,53,4,29,154,142,210,220,250,82,41,202,67,
-  211,95,45,201,59,178,4,148,115,49,66,60,238,121,119,247,203,173,117,237,
-  69,209,32,86,113,153,238,183,169,210,159,130,32,197,51,251,198,166,113,231,
-  158,110,195,9,157,86,233,242,237,85,175,84,213,127,103,65,181,238,75,127,
-  212,222,209,28,130,66,252,86,163,43,78,16,226,189,137,167,252,247,34,46,
-  66,167,180,88,104,47,197,20,65,200,162,31,29,250,72,3,128,188,21,224,
-  250,1,88,49,91,245,50,99,113,103,7,230,106,196,142,72,95,216,217,209,
-  13,144,157,238,189,180,166,116,236,62,136,205,53,151,229,229,154,26,215,72,
-  219,215,222,191,123,125,37,41,124,184,180,145,115,168,242,61,252,95,43,239,
-  49,205,174,178,42,57,202,214,138,195,172,198,159,91,69,91,208,170,16,50,
-  252,94,43,239,17,171,236,254,90,171,126,176,202,94,175,181,238,254,78,74,
-  13,136,174,94,170,106,175,215,42,240,127,41,8,89,43,178,235,173,85,3,
-  95,213,198,188,181,102,214,23,38,63,230,203,77,51,1,16,27,103,146,42,
-  221,107,186,178,121,74,95,137,142,56,167,100,204,183,22,103,98,35,89,91,
-  140,205,54,127,52,160,164,21,199,184,30,67,115,25,193,124,178,104,65,97,
-  45,143,33,158,156,159,238,63,81,56,66,145,35,217,22,106,44,18,10,186,
-  205,33,45,209,171,237,201,236,236,39,227,195,126,200,44,41,49,78,239,15,
-  140,137,228,45,134,186,243,220,47,101,87,237,90,27,151,216,63,89,43,75,
-  135,198,30,19,223,149,213,109,170,100,244,83,59,94,212,218,130,44,46,210,
-  35,197,12,229,52,189,92,20,118,141,169,165,189,54,76,145,89,243,40,129,
-  51,42,238,20,126,201,27,96,153,243,13,161,173,105,109,123,233,141,22,218,
-  139,131,159,124,252,29,6,67,207,29,94,243,102,76,170,92,119,58,5,241,
-  187,211,4,168,189,147,13,206,183,96,232,169,122,3,159,196,237,91,224,151,
-  59,84,12,142,9,235,183,49,133,196,159,129,52,130,142,249,183,192,187,42,
-  162,203,74,8,126,69,212,49,203,51,220,40,233,132,136,143,208,162,200,194,
-  132,149,100,48,36,87,40,173,142,7,179,254,187,54,40,194,107,82,113,4,
-  148,43,250,93,227,181,76,82,112,124,103,212,154,199,143,28,23,102,200,201,
-  252,189,144,1,220,31,95,56,197,147,51,217,85,98,179,72,252,13,99,99,
-  69,255,139,26,248,13,67,64,235,220,219,209,104,165,171,116,15,220,235,240,
-  185,181,18,92,47,76,15,191,212,225,116,1,30,5,218,173,213,136,59,139,
-  214,172,111,65,164,123,5,19,96,125,67,94,33,44,175,66,181,96,156,171,
-  188,136,196,245,233,139,12,51,21,174,104,214,60,209,44,138,233,111,47,214,
-  173,239,60,140,174,31,104,126,231,183,95,211,190,164,134,175,218,98,189,208,
-  74,202,100,242,9,86,185,228,102,103,189,33,34,125,151,219,12,241,127,213,
-  159,117,22,191,89,123,62,232,220,40,219,67,247,171,41,211,202,179,113,225,
-  86,28,190,167,63,225,120,102,43,9,3,56,55,253,170,155,217,90,193,161,
-  68,68,235,4,223,231,155,175,208,160,114,44,67,42,145,168,79,175,200,52,
-  26,253,97,147,248,53,253,97,34,122,221,52,33,193,42,197,173,220,201,155,
-  152,188,27,215,206,249,33,138,180,217,144,221,147,181,89,201,122,23,15,50,
-  110,69,182,141,175,127,21,29,97,76,156,89,231,227,223,63,235,204,124,55,
-  73,181,191,182,230,151,85,191,255,143,214,203,216,8,189,49,117,189,127,50,
-  47,243,161,151,238,130,165,63,82,12,212,46,130,95,198,3,201,177,147,182,
-  241,215,232,225,228,143,5,149,169,168,202,50,107,211,237,80,250,46,168,227,
-  93,253,183,221,118,249,175,12,255,47,70,132,108,70,117,120,0,0
+  31,139,8,0,0,0,0,0,2,255,197,125,253,123,218,198,178,255,239,252,
+  21,91,218,147,64,3,50,224,151,56,96,236,235,56,238,73,218,56,241,19,
+  147,166,167,125,122,137,64,11,40,22,18,213,74,198,142,195,253,219,191,159,
+  153,93,9,9,132,67,114,239,243,124,79,78,49,90,205,236,204,206,206,206,
+  203,190,113,244,131,19,12,163,187,153,20,147,104,234,29,151,142,232,143,240,
+  108,127,220,45,75,191,124,124,52,145,182,115,124,52,149,145,45,134,19,59,
+  84,50,234,150,227,104,84,63,44,155,82,223,158,202,110,249,198,149,243,89,
+  16,70,101,49,12,252,72,250,128,154,187,78,52,233,58,242,198,29,202,58,
+  63,212,92,223,141,92,219,171,171,161,237,201,110,179,12,122,145,27,121,242,
+  248,77,239,82,156,121,193,240,90,92,4,206,209,142,46,44,29,169,232,142,
+  254,182,195,32,136,238,235,245,193,184,253,227,104,15,255,154,157,122,125,104,
+  135,14,30,71,35,124,31,225,69,115,136,127,54,30,166,113,212,254,241,192,
+  198,191,61,60,121,174,47,219,63,202,134,108,56,244,50,184,6,164,243,212,
+  222,125,134,135,185,29,250,237,31,159,237,29,180,26,13,60,14,108,84,56,
+  216,107,237,54,15,241,100,15,135,4,186,39,157,195,69,233,191,166,210,113,
+  237,202,44,148,35,25,170,250,48,240,130,16,173,152,200,169,108,59,118,120,
+  93,189,207,242,216,220,197,191,86,202,99,211,193,191,129,97,83,14,240,239,
+  48,97,243,217,0,255,246,83,54,119,91,187,173,150,52,108,238,217,142,60,
+  108,164,108,142,6,131,81,107,47,97,115,116,248,180,249,180,153,176,249,212,
+  182,91,163,209,98,81,250,249,126,16,220,214,149,251,217,245,199,237,65,16,
+  58,50,172,163,100,49,8,156,187,251,169,29,142,93,191,221,232,140,208,69,
+  237,230,222,236,118,167,105,237,237,11,117,167,34,57,173,199,110,173,110,207,
+  102,158,172,235,130,218,149,28,7,82,188,127,85,83,182,175,234,74,134,238,
+  168,51,176,135,215,227,48,136,125,167,125,99,135,21,106,111,181,195,226,48,
+  207,163,113,117,81,154,218,174,15,114,183,186,219,219,135,135,141,217,109,39,
+  33,47,236,56,10,58,51,219,113,136,201,230,193,236,118,81,34,45,147,225,
+  189,227,170,153,103,223,181,71,158,188,237,208,71,125,30,218,179,54,125,116,
+  108,207,29,251,117,23,140,169,246,16,10,38,195,206,24,239,128,46,168,41,
+  73,245,248,42,26,194,212,218,188,167,166,146,60,100,187,249,52,195,195,226,
+  199,33,105,27,191,110,31,52,26,162,69,245,196,110,125,26,248,129,154,217,
+  67,89,187,144,190,23,212,206,2,95,5,158,173,106,233,139,69,201,162,110,
+  189,95,147,4,149,86,59,90,232,237,38,170,3,162,235,8,253,146,250,55,
+  121,89,15,109,199,141,85,187,73,82,73,229,64,140,19,219,134,71,116,91,
+  20,5,83,46,71,75,90,217,150,180,0,21,201,219,168,30,133,232,153,81,
+  16,78,219,241,108,38,195,161,173,100,199,147,17,100,83,39,94,169,94,171,
+  241,84,78,115,61,4,197,171,46,59,163,33,14,137,64,100,15,60,121,175,
+  187,171,217,104,252,43,97,21,136,158,61,83,178,157,124,89,68,206,125,194,
+  243,62,201,186,115,35,195,200,197,128,174,115,15,181,163,96,150,32,227,107,
+  177,32,64,47,108,143,220,80,69,245,225,196,245,28,129,74,51,56,13,16,
+  201,190,190,95,99,95,51,186,123,240,175,68,126,245,208,29,79,34,22,13,
+  58,136,58,75,11,108,100,79,93,239,174,189,85,207,118,2,52,101,228,5,
+  115,173,117,182,127,55,159,200,144,58,28,67,110,44,211,102,131,134,120,134,
+  46,200,247,230,51,42,90,233,36,126,156,75,102,13,90,182,174,28,195,56,
+  12,161,203,103,212,62,208,9,252,92,83,131,235,234,194,10,70,163,181,246,
+  47,44,178,9,185,98,42,64,57,56,205,21,227,25,210,246,236,129,244,210,
+  209,53,32,213,79,52,128,148,16,74,64,35,104,141,74,201,245,103,113,244,
+  23,185,135,46,233,219,223,181,76,129,31,79,7,50,252,187,166,164,39,135,
+  81,86,117,18,57,29,166,50,218,106,56,144,238,111,99,94,180,249,114,125,
+  244,141,27,209,104,156,92,231,13,7,153,5,162,93,96,49,86,171,50,99,
+  141,21,149,7,154,21,6,243,245,218,120,164,126,221,30,101,107,211,138,56,
+  14,93,39,173,142,30,58,244,81,7,18,74,34,73,195,43,158,250,48,5,
+  163,80,224,63,38,150,88,47,227,115,150,102,20,110,106,118,91,189,215,149,
+  110,172,7,94,96,16,195,116,248,247,89,57,101,59,69,219,203,2,225,23,
+  247,21,60,76,117,189,99,184,84,139,147,157,48,52,89,225,251,44,112,73,
+  20,9,15,150,146,195,172,165,100,131,53,179,73,231,115,125,65,181,45,52,
+  74,27,226,34,99,228,220,7,100,194,162,187,54,124,84,82,189,35,71,118,
+  236,161,215,225,137,239,231,19,72,159,13,157,108,227,153,251,166,88,131,190,
+  81,11,83,155,156,113,91,102,156,36,206,179,197,206,115,127,91,151,225,32,
+  82,114,61,37,84,60,69,125,119,247,121,105,109,50,207,90,147,64,120,97,
+  249,65,36,239,55,89,241,195,12,107,198,250,236,178,250,33,22,243,239,51,
+  166,158,59,62,105,221,51,210,132,214,154,38,28,230,205,216,110,145,98,172,
+  152,45,34,99,201,48,92,183,60,250,213,6,99,85,58,218,209,1,222,209,
+  142,142,50,41,74,65,84,137,224,129,2,81,14,9,16,128,54,243,209,161,
+  56,130,76,125,225,58,8,58,101,136,120,19,162,86,221,50,204,100,89,112,
+  117,221,114,214,236,238,53,86,229,130,192,117,135,170,32,178,77,10,50,147,
+  234,56,36,40,31,215,235,109,254,127,2,149,190,103,47,144,18,228,39,65,
+  100,143,45,203,90,86,169,217,46,29,57,238,141,174,21,18,72,145,244,195,
+  196,117,28,73,192,128,57,46,129,3,24,80,55,240,83,32,4,18,20,121,
+  183,142,175,34,59,138,21,42,109,29,31,177,135,166,128,25,50,137,156,227,
+  215,1,92,174,136,220,169,68,184,236,80,17,83,139,184,60,165,71,42,136,
+  22,105,144,157,40,92,226,247,128,41,62,7,254,10,122,239,243,22,184,31,
+  220,250,47,110,30,239,131,59,114,139,129,169,243,16,59,162,175,242,24,111,
+  162,217,22,164,222,65,41,131,60,34,23,109,129,250,218,86,145,96,234,119,
+  254,48,95,197,21,74,138,145,46,164,173,226,80,58,194,65,180,27,229,177,
+  94,80,209,3,180,66,137,236,104,133,87,42,218,68,105,26,132,119,121,112,
+  148,109,211,117,176,250,34,136,35,184,226,149,206,195,139,45,240,175,102,65,
+  48,90,17,8,21,61,160,40,10,163,93,68,129,136,38,82,92,156,189,207,
+  35,191,154,218,153,113,81,64,119,71,235,46,198,136,86,244,135,117,30,241,
+  43,204,147,209,122,10,110,153,202,168,108,198,148,65,32,255,103,138,240,201,
+  1,142,0,112,183,236,67,175,114,74,199,239,0,195,177,139,224,216,165,76,
+  209,76,153,235,37,112,1,31,235,73,127,140,116,181,124,176,91,230,4,101,
+  24,192,181,202,72,38,150,101,38,61,15,249,222,240,26,172,216,158,146,68,
+  91,143,223,117,22,220,27,12,65,230,97,134,168,89,176,141,71,145,168,160,
+  209,129,239,168,106,49,83,58,162,210,108,113,21,98,234,250,221,114,115,159,
+  25,236,150,15,15,96,204,200,200,201,25,74,31,98,0,141,106,105,6,192,
+  171,71,46,81,52,69,101,128,180,254,90,116,69,236,199,74,58,213,45,36,
+  211,250,63,23,13,42,221,93,225,172,245,61,156,237,254,111,57,219,201,178,
+  150,40,225,4,230,63,71,147,145,145,64,167,116,71,208,237,247,74,242,64,
+  72,91,160,53,77,137,10,168,162,21,244,110,22,186,228,232,133,237,59,2,
+  190,123,2,141,22,18,28,100,218,54,75,200,146,111,47,195,214,135,238,48,
+  74,17,231,110,52,1,5,215,163,164,164,70,117,8,142,106,240,57,112,125,
+  75,188,245,165,161,43,92,37,72,108,194,142,132,205,30,193,18,167,37,95,
+  206,189,59,161,131,115,188,51,160,19,91,137,131,134,80,52,150,67,57,3,
+  196,64,162,95,116,123,124,8,152,42,3,35,210,233,136,192,31,74,225,70,
+  140,131,168,109,46,201,44,186,4,81,250,20,195,247,57,128,192,255,199,1,
+  181,77,185,232,11,192,19,183,34,154,7,121,205,87,150,248,128,68,78,138,
+  48,246,125,2,7,166,189,148,95,86,96,168,61,148,204,129,144,168,235,78,
+  236,54,104,24,196,145,84,44,204,107,41,103,138,49,148,7,153,184,35,98,
+  73,179,167,224,133,103,235,130,237,1,150,20,238,50,8,60,97,171,107,69,
+  154,8,129,138,169,110,56,188,251,40,136,67,129,194,145,123,35,197,63,49,
+  2,102,166,38,38,40,183,196,171,164,21,208,79,248,118,97,15,96,124,197,
+  179,6,228,88,66,40,11,17,194,248,235,80,206,116,130,199,206,121,105,132,
+  68,5,125,23,81,63,190,57,189,170,129,76,40,231,104,124,85,132,54,90,
+  18,106,38,108,49,139,7,158,59,68,85,129,103,154,146,25,57,209,103,216,
+  181,140,215,214,106,116,164,123,88,27,98,130,32,35,75,37,91,90,203,232,
+  115,249,248,242,237,213,171,63,68,239,79,244,142,39,191,54,246,128,240,127,
+  109,19,28,5,23,249,194,190,243,40,96,19,202,190,129,134,44,217,200,52,
+  144,1,75,71,193,140,61,7,122,36,6,61,162,94,62,254,5,234,22,204,
+  89,47,72,60,220,20,81,25,66,174,8,210,162,185,11,213,180,197,157,180,
+  67,12,64,141,191,86,145,138,160,95,236,134,222,142,70,109,145,60,242,136,
+  18,232,45,70,223,136,237,24,254,13,118,242,184,17,123,217,77,121,131,180,
+  77,167,77,194,209,20,132,154,45,177,35,90,123,172,165,194,36,153,133,114,
+  51,240,133,130,59,197,103,27,213,166,226,131,123,23,149,164,214,216,143,92,
+  143,70,216,28,57,164,212,227,46,148,99,23,62,40,35,201,149,138,91,123,
+  147,242,177,169,97,19,76,179,53,225,6,228,97,214,132,82,208,116,21,34,
+  116,123,69,99,54,68,167,250,193,252,107,26,171,81,192,182,237,4,62,44,
+  30,130,17,23,227,24,14,181,222,92,119,8,43,198,131,196,35,60,116,157,
+  175,27,79,241,8,134,248,40,12,166,169,180,72,54,100,212,232,153,218,163,
+  82,17,193,236,145,25,167,23,47,174,154,187,141,22,108,219,20,38,210,161,
+  17,31,9,102,103,98,207,102,18,181,195,146,17,28,235,11,140,48,226,70,
+  237,3,168,144,51,147,199,74,4,115,95,232,44,89,213,144,138,25,51,138,
+  184,115,130,98,215,115,74,100,77,164,118,8,49,148,238,46,245,61,73,43,
+  52,231,100,72,169,251,73,201,239,20,85,99,186,203,18,151,46,5,11,45,
+  178,134,84,70,213,105,35,85,98,35,53,183,117,91,201,132,218,166,74,110,
+  203,212,6,49,178,216,2,166,128,60,144,230,72,12,201,178,121,224,117,230,
+  250,172,72,212,166,151,111,223,191,235,255,242,246,221,197,105,143,254,156,157,
+  151,80,3,183,62,64,100,171,5,161,174,101,52,156,212,4,178,252,225,132,
+  194,221,16,49,2,117,130,22,14,113,97,140,228,86,118,238,214,25,76,203,
+  58,115,17,60,11,49,117,201,104,207,179,17,98,214,150,106,248,213,81,222,
+  106,64,179,27,194,121,62,21,117,65,9,115,32,204,148,68,13,242,139,48,
+  68,162,141,22,162,121,8,141,63,36,220,205,32,7,0,57,120,24,100,31,
+  32,251,15,131,236,1,100,239,97,16,4,97,205,221,135,65,48,56,154,77,
+  211,212,103,248,139,172,31,173,212,206,175,185,115,168,189,182,22,224,134,42,
+  208,224,135,219,251,180,124,252,244,65,0,52,246,225,182,34,204,109,25,30,
+  17,37,184,211,88,15,75,221,53,246,112,40,103,145,122,200,234,174,41,202,
+  76,77,3,71,38,154,66,223,167,136,52,16,116,20,170,73,2,189,202,86,
+  131,221,64,170,35,182,55,215,227,108,179,180,203,199,23,24,32,117,49,179,
+  195,107,68,20,209,92,74,95,188,232,189,186,192,131,141,172,65,61,36,130,
+  11,251,22,168,30,130,49,10,69,152,221,26,197,71,115,122,196,48,215,241,
+  209,22,222,103,61,116,66,172,107,155,248,144,194,58,79,114,164,203,163,88,
+  222,184,14,7,125,3,9,27,67,54,13,178,34,195,64,192,131,128,124,103,
+  18,239,97,108,88,165,222,31,90,95,200,38,80,60,27,5,241,144,12,151,
+  34,163,71,195,153,166,119,18,113,163,59,225,62,217,202,217,163,136,98,164,
+  56,228,170,92,178,155,176,67,48,14,102,238,38,151,120,210,116,168,80,67,
+  239,90,72,196,168,102,90,166,38,10,32,57,84,29,80,36,27,25,48,178,
+  139,69,117,146,77,134,214,171,4,12,29,245,28,92,59,174,61,246,3,21,
+  185,67,5,233,163,209,119,98,26,147,252,97,84,41,14,252,44,195,192,18,
+  103,49,219,42,209,251,163,164,91,207,214,16,99,73,65,42,115,49,71,160,
+  196,2,35,101,85,74,199,145,176,187,118,168,150,166,191,38,6,119,218,40,
+  218,240,14,58,79,36,59,233,60,207,197,137,91,166,49,74,39,251,156,243,
+  11,233,243,100,107,146,187,204,80,67,52,65,180,58,158,180,141,183,71,36,
+  171,157,87,18,102,103,114,152,111,162,59,8,130,104,8,243,252,28,127,225,
+  37,16,91,56,228,208,2,159,9,153,0,70,84,26,141,118,163,81,19,141,
+  93,253,167,165,255,52,241,39,67,56,99,243,195,96,14,178,218,45,26,186,
+  42,30,192,188,155,214,218,55,148,93,225,243,104,71,3,101,166,244,70,83,
+  53,206,204,7,154,177,64,78,126,203,217,138,183,49,26,65,42,47,167,51,
+  9,71,25,99,172,140,164,116,120,246,98,109,60,157,251,55,110,24,248,83,
+  154,77,33,31,124,230,33,233,129,190,158,233,56,245,204,246,109,199,22,87,
+  31,222,62,175,95,188,174,9,10,100,161,76,80,48,164,12,136,103,65,65,
+  63,7,190,85,122,161,253,142,56,251,240,225,57,121,252,231,113,232,65,207,
+  72,8,151,46,0,235,90,97,52,184,56,63,59,59,51,1,196,91,251,250,
+  198,245,168,58,27,52,145,57,34,150,24,200,161,29,235,180,150,227,135,146,
+  31,164,168,238,18,5,105,231,128,50,26,243,66,113,204,224,221,117,16,10,
+  80,120,197,153,157,231,36,9,13,162,59,130,9,229,39,157,131,102,227,8,
+  211,219,210,49,10,188,50,187,249,11,139,48,51,201,52,167,169,80,249,192,
+  228,91,144,97,76,193,118,230,177,193,246,54,19,99,104,14,66,150,129,92,
+  209,201,124,93,31,8,104,219,249,199,17,5,49,121,252,95,168,168,24,229,
+  140,6,5,70,88,30,129,75,183,32,248,82,218,51,152,145,48,128,25,41,
+  160,75,175,183,152,165,219,24,79,101,189,228,92,69,126,153,167,167,121,84,
+  192,108,167,9,169,30,255,76,145,128,114,225,120,38,113,124,186,109,222,152,
+  245,212,89,22,6,31,152,135,71,254,64,205,58,41,117,99,6,216,220,48,
+  64,210,18,140,96,109,5,18,189,94,90,131,141,4,124,178,44,15,17,32,
+  128,28,1,238,91,157,148,172,212,94,236,96,19,9,122,72,23,144,52,58,
+  214,20,178,8,172,241,208,26,218,59,81,128,44,114,39,163,216,106,199,9,
+  134,59,106,30,12,234,183,83,175,111,26,210,39,100,107,168,110,138,102,63,
+  116,71,220,94,144,153,171,107,128,173,236,90,47,99,207,146,169,230,34,139,
+  246,166,119,70,1,10,6,183,78,108,58,226,223,151,175,222,62,165,233,243,
+  27,169,114,201,203,233,139,51,72,198,33,35,195,254,69,180,16,73,7,147,
+  105,77,71,19,45,171,37,226,95,16,20,148,244,242,157,64,104,149,36,47,
+  168,229,242,195,133,37,94,179,3,229,184,7,190,202,211,79,129,23,145,33,
+  235,66,13,201,246,88,226,119,83,162,38,100,238,96,129,76,114,49,179,157,
+  90,201,4,19,19,158,61,163,105,30,100,79,144,95,64,6,19,161,133,210,
+  38,96,74,225,5,172,26,88,166,30,9,181,97,180,196,149,164,233,29,102,
+  160,198,38,111,217,66,49,162,37,192,146,153,240,147,134,162,27,62,156,164,
+  228,114,148,208,134,190,189,179,231,166,133,149,70,125,233,169,240,14,81,30,
+  194,225,102,211,184,171,106,193,144,227,42,86,166,147,121,18,185,97,230,144,
+  247,41,172,223,168,241,188,128,240,144,198,231,86,24,244,144,130,68,18,5,
+  249,202,128,138,120,177,12,113,49,229,182,149,71,142,28,119,206,10,27,193,
+  166,32,223,8,61,233,221,176,154,166,61,245,86,210,34,74,201,54,54,232,
+  45,81,124,160,61,244,126,221,66,4,204,226,215,219,51,129,194,149,143,95,
+  226,51,105,78,77,236,18,127,133,173,98,232,13,205,218,79,154,181,159,52,
+  235,224,161,102,189,100,194,15,180,139,1,114,13,99,46,57,121,102,229,218,
+  100,159,182,81,83,135,98,86,234,121,94,204,48,81,201,50,65,202,182,89,
+  131,22,41,100,178,168,209,108,101,150,52,178,105,246,122,227,87,27,156,13,
+  212,151,198,142,73,190,73,103,126,245,216,68,175,134,48,9,10,67,92,7,
+  65,38,92,209,249,5,211,55,195,57,8,4,98,111,239,142,246,64,162,113,
+  73,38,70,185,15,51,167,172,213,104,209,24,246,245,14,160,150,229,116,139,
+  226,125,216,60,173,42,156,41,177,182,164,125,81,202,143,181,11,59,68,160,
+  144,171,34,107,150,167,244,122,3,238,21,152,94,25,168,100,87,20,21,139,
+  74,232,210,54,63,193,126,182,154,209,132,130,201,115,230,65,144,234,42,200,
+  5,95,89,84,73,146,199,178,166,41,1,12,26,50,124,179,16,201,139,153,
+  37,76,205,24,47,25,32,162,178,4,245,7,7,25,84,0,39,89,186,56,
+  63,189,122,255,238,252,133,142,183,80,200,89,163,233,148,80,214,145,62,38,
+  22,153,123,135,87,11,144,13,236,213,196,97,77,52,119,241,31,254,182,90,
+  248,239,41,134,30,254,238,62,133,29,183,253,59,118,28,37,90,113,129,1,
+  71,222,130,42,97,200,217,155,184,58,182,67,172,237,5,99,152,104,248,30,
+  61,79,236,88,226,223,180,0,96,244,129,167,251,98,180,175,101,22,76,104,
+  214,201,147,102,197,164,148,204,250,161,121,148,198,116,214,38,234,180,206,17,
+  136,103,143,225,132,196,192,29,139,79,241,116,86,188,76,177,236,31,162,174,
+  68,131,72,50,125,39,142,238,208,210,125,161,187,64,203,145,183,199,177,208,
+  61,155,115,78,194,225,201,3,118,60,174,95,226,9,70,201,25,187,87,51,
+  139,41,220,176,84,167,41,95,39,247,168,147,60,245,79,76,153,254,28,124,
+  195,209,69,144,247,93,18,7,75,26,10,68,139,216,215,50,164,169,70,40,
+  175,227,120,137,132,169,224,221,25,101,42,145,94,148,154,186,74,113,74,16,
+  242,242,149,19,104,113,41,241,41,24,112,122,98,179,102,152,48,128,250,69,
+  37,43,47,78,201,132,3,233,68,235,140,7,167,208,177,129,94,15,179,73,
+  8,211,57,49,173,59,176,88,176,207,37,77,109,167,195,46,155,107,154,137,
+  8,10,20,80,27,45,51,65,81,220,177,207,26,200,13,68,134,239,70,177,
+  99,166,100,253,168,228,250,138,68,99,102,118,7,72,185,174,33,165,90,146,
+  43,115,14,100,147,4,124,155,38,204,51,178,206,84,70,162,108,180,181,162,
+  145,152,15,169,250,39,135,20,61,136,67,45,24,39,12,102,172,117,13,134,
+  102,205,7,80,253,208,18,108,202,109,225,203,49,226,63,232,171,30,102,122,
+  20,2,129,167,70,32,103,107,99,60,72,201,234,55,71,132,43,51,30,133,
+  155,82,206,206,5,176,104,63,40,130,85,177,35,242,137,140,115,182,33,129,
+  187,58,123,253,27,77,99,255,19,75,127,152,207,182,156,151,159,139,113,46,
+  3,207,227,117,162,44,48,21,62,144,140,33,217,152,66,152,121,28,122,179,
+  109,54,71,29,156,199,126,135,146,109,177,121,13,37,143,254,129,138,182,217,
+  6,147,153,133,89,219,243,67,76,108,179,229,231,37,173,232,232,5,140,21,
+  25,227,69,49,202,171,171,119,121,208,87,42,220,152,54,234,61,110,240,203,
+  122,147,91,154,205,98,72,241,44,33,194,121,168,154,121,121,100,28,1,235,
+  133,79,171,83,233,46,145,164,162,173,83,21,21,41,147,157,172,76,11,37,
+  27,194,50,219,233,26,229,21,87,121,9,104,140,162,188,179,108,90,194,148,
+  243,252,36,123,202,13,174,182,192,75,183,44,241,194,88,24,118,210,122,246,
+  74,212,143,69,99,31,95,54,249,108,88,163,124,61,187,176,195,122,253,196,
+  227,180,74,175,186,64,12,55,110,116,183,161,22,234,160,92,37,123,150,64,
+  47,210,78,128,81,93,175,79,20,226,229,39,25,116,196,32,185,9,131,220,
+  116,221,38,230,105,71,85,62,218,65,9,47,129,103,179,225,204,110,187,232,
+  50,12,214,231,222,86,157,34,2,128,166,246,117,109,61,243,75,145,25,173,
+  173,249,202,18,173,108,154,73,253,52,74,214,240,217,29,178,81,166,80,143,
+  118,168,43,237,160,207,175,46,119,91,169,221,151,178,148,113,7,108,245,181,
+  245,212,165,99,56,171,196,138,134,50,217,209,69,219,139,224,29,104,106,157,
+  226,147,59,201,150,54,148,57,125,61,218,49,219,24,213,16,209,86,116,92,
+  162,41,252,72,244,254,236,254,85,250,171,108,38,250,118,196,251,171,114,173,
+  124,58,133,219,67,190,127,21,245,127,13,38,190,66,209,155,171,222,110,123,
+  183,241,230,69,175,118,177,107,181,172,70,237,162,217,180,154,86,163,252,119,
+  109,35,254,75,219,115,71,200,17,81,114,213,219,59,253,38,220,94,16,6,
+  126,20,160,228,252,170,183,127,254,77,184,31,92,223,119,103,114,140,162,179,
+  171,222,193,217,55,33,191,147,24,153,182,65,125,8,240,220,153,18,135,62,
+  138,46,174,122,79,47,190,137,202,239,182,15,13,166,253,162,181,242,229,85,
+  239,240,242,219,26,72,27,141,39,65,168,164,33,254,16,240,127,36,45,165,
+  95,251,238,72,126,23,171,175,254,129,59,119,163,239,234,137,55,114,222,255,
+  79,16,94,127,23,242,217,4,159,227,224,187,122,241,133,244,181,112,191,189,
+  189,151,147,64,250,238,237,22,146,125,29,168,254,41,194,60,79,170,239,234,
+  198,83,127,136,78,164,189,138,40,251,237,170,247,236,244,183,173,240,47,237,
+  161,59,114,135,59,47,225,89,189,216,139,81,244,242,170,215,52,176,175,17,
+  132,249,194,208,200,80,187,144,183,238,48,232,159,193,84,231,180,123,19,124,
+  207,253,20,219,60,18,30,106,217,38,236,127,199,8,55,167,182,103,111,69,
+  235,18,132,166,182,209,146,135,65,159,7,227,32,162,130,163,122,99,255,248,
+  43,192,175,221,233,182,160,103,118,104,15,109,165,161,247,142,247,30,134,190,
+  178,253,200,213,202,169,193,241,185,123,92,187,120,6,201,28,236,180,246,106,
+  23,123,230,219,195,245,156,134,99,4,241,48,56,59,207,17,107,146,62,185,
+  161,52,76,236,30,239,126,141,137,160,127,105,199,94,176,37,252,5,157,132,
+  164,53,210,109,17,94,219,168,255,243,150,34,121,105,223,216,137,225,220,95,
+  142,214,157,84,97,118,154,95,151,105,208,127,17,208,210,107,96,156,198,87,
+  212,38,134,35,13,250,239,160,215,57,248,243,24,201,10,141,42,253,5,3,
+  213,119,216,80,255,251,162,215,120,126,197,172,237,19,67,96,173,65,223,138,
+  209,94,208,246,183,4,237,213,214,104,175,93,53,96,106,31,206,123,141,15,
+  231,91,227,93,216,14,205,112,65,128,231,189,122,243,108,137,152,160,237,236,
+  22,35,94,218,161,171,190,3,239,121,24,35,57,242,190,7,245,116,74,219,
+  137,28,123,250,61,100,101,168,197,250,173,136,127,198,232,245,201,119,32,190,
+  11,166,242,59,208,126,119,165,175,53,250,91,59,4,70,61,254,30,138,31,
+  236,80,217,243,239,64,188,138,130,225,245,36,240,190,167,63,222,42,182,32,
+  223,138,118,134,15,127,2,239,245,61,93,249,18,106,231,250,215,46,149,0,
+  181,117,158,25,38,187,41,242,134,225,124,74,97,180,250,46,212,231,49,29,
+  26,71,168,252,93,216,191,221,185,55,223,133,248,138,54,111,14,98,143,76,
+  233,19,216,221,250,6,177,92,4,106,24,204,57,244,248,109,13,230,52,242,
+  200,235,12,17,162,222,93,127,178,111,220,107,99,154,52,220,233,136,108,34,
+  98,132,11,61,9,118,110,115,43,117,49,220,27,29,98,67,212,105,107,30,
+  26,199,13,124,54,143,107,100,160,127,221,61,216,223,105,237,111,83,207,107,
+  56,61,18,253,135,83,116,248,118,132,221,48,200,11,109,15,162,218,223,73,
+  116,100,47,117,146,15,87,132,84,4,89,146,84,131,56,164,200,254,10,230,
+  190,222,218,6,241,13,113,48,96,85,3,211,187,219,160,156,14,135,161,253,
+  13,210,61,245,198,174,12,83,67,250,48,138,114,209,24,9,219,107,123,146,
+  198,235,43,106,200,43,237,48,247,72,28,7,121,63,241,80,61,207,165,27,
+  198,133,202,188,28,130,91,84,243,206,189,179,157,201,170,118,62,132,1,223,
+  104,187,26,97,239,184,190,247,117,132,158,156,132,182,111,72,236,54,64,4,
+  249,228,22,13,180,199,19,199,118,214,88,195,187,4,228,55,138,220,38,196,
+  204,229,111,189,250,126,1,64,224,93,219,28,51,146,168,247,151,116,115,149,
+  68,19,154,139,139,53,165,253,189,253,99,64,238,21,212,246,98,98,95,155,
+  65,116,112,92,63,88,7,248,143,141,248,197,180,244,128,90,122,80,72,241,
+  57,192,174,131,107,13,247,244,184,254,116,29,228,87,80,10,153,241,15,175,
+  158,23,1,92,33,84,178,103,65,40,117,45,135,199,245,195,130,166,197,8,
+  195,251,175,227,233,44,14,31,130,187,176,125,215,51,241,126,209,123,164,27,
+  227,254,111,248,160,124,227,183,66,144,158,141,188,219,213,49,96,209,251,43,
+  154,22,159,216,15,65,200,128,205,36,210,161,250,179,2,2,193,245,29,89,
+  147,95,139,95,191,247,108,216,89,27,157,253,96,75,79,189,169,205,89,16,
+  245,244,113,145,202,244,108,53,185,70,100,254,16,204,111,118,106,209,247,168,
+  155,247,10,187,153,206,164,78,7,129,169,136,224,138,21,240,119,207,118,220,
+  155,64,69,70,37,154,128,108,22,192,253,71,66,151,17,254,250,198,14,110,
+  100,239,77,128,218,220,129,27,170,53,29,123,59,148,232,107,134,140,85,20,
+  218,30,192,47,17,74,147,5,56,253,176,236,152,34,184,23,118,56,231,232,
+  237,148,122,240,89,218,150,34,216,83,71,122,54,242,141,44,244,41,167,6,
+  48,77,77,138,18,246,56,49,216,221,92,197,115,132,182,3,219,231,42,96,
+  221,82,145,20,193,94,221,57,190,188,91,66,158,158,127,19,169,11,233,13,
+  130,56,204,210,250,198,26,94,6,3,140,215,111,68,79,178,249,211,120,120,
+  77,107,188,52,219,246,39,161,183,222,252,73,232,207,116,60,245,21,236,179,
+  9,12,24,135,227,80,157,22,89,175,102,11,230,11,15,187,120,48,181,236,
+  80,81,90,85,106,221,214,107,251,197,253,228,154,170,168,162,77,96,72,242,
+  57,224,156,20,118,76,2,117,25,132,81,255,2,70,74,13,238,214,84,123,
+  29,188,103,79,220,136,169,3,232,120,51,220,233,204,213,102,184,9,183,208,
+  220,40,152,30,12,22,236,193,44,94,131,125,223,59,67,89,250,9,66,127,
+  119,204,180,232,79,93,183,123,236,4,195,152,118,70,90,99,25,157,195,85,
+  227,235,243,187,87,78,197,173,38,96,82,13,187,170,203,39,229,252,113,69,
+  85,45,58,194,102,15,101,101,231,175,71,71,199,229,191,119,198,181,97,247,
+  184,114,95,126,84,110,151,31,217,211,89,135,152,160,239,94,68,95,143,233,
+  235,152,190,62,46,63,198,215,127,226,0,15,139,191,134,127,87,83,26,8,
+  176,187,83,16,153,170,163,102,163,209,56,153,170,39,101,49,85,130,38,31,
+  218,40,124,214,160,210,11,244,190,197,75,145,149,169,218,33,192,42,192,150,
+  80,8,179,228,193,10,212,65,195,128,33,225,214,128,84,186,107,29,200,131,
+  170,21,5,191,184,183,210,169,52,9,96,194,175,19,142,156,56,164,86,19,
+  233,19,98,70,149,219,32,176,151,231,130,170,55,117,163,94,84,11,106,171,
+  181,162,70,79,70,162,119,126,113,217,191,56,253,163,187,223,68,134,252,59,
+  127,221,109,236,55,245,91,90,31,122,29,216,142,116,186,188,1,175,54,136,
+  213,157,249,74,199,17,33,124,105,95,119,27,157,210,40,246,245,138,12,45,
+  159,158,5,190,95,25,122,170,54,85,227,234,189,102,124,216,253,169,162,79,
+  188,87,59,238,168,242,131,126,101,233,211,239,221,40,140,101,39,148,180,173,
+  187,179,24,90,60,237,255,134,239,146,34,20,81,126,130,218,58,67,139,54,
+  14,158,153,43,165,80,65,39,197,103,150,58,139,210,146,143,145,235,121,189,
+  207,149,132,188,34,242,116,38,174,74,119,226,136,113,215,143,61,175,22,232,
+  191,157,146,232,253,105,161,177,231,136,101,42,149,191,198,225,172,70,55,89,
+  213,232,224,216,223,213,238,241,61,56,70,225,15,221,46,152,30,119,241,181,
+  3,212,84,71,135,144,66,36,141,154,86,202,193,44,162,149,105,162,21,140,
+  45,222,159,194,40,202,226,211,61,206,25,93,99,83,9,198,85,48,44,132,
+  230,47,232,250,114,46,222,242,150,252,74,74,155,43,200,33,1,7,218,41,
+  242,85,101,80,203,103,48,136,193,148,143,188,65,201,135,252,84,174,106,156,
+  192,215,75,227,221,138,105,147,178,120,185,24,237,74,33,89,76,229,170,126,
+  209,53,0,157,5,240,147,55,129,207,123,122,116,37,154,251,155,110,14,205,
+  194,152,156,86,232,70,16,122,57,237,146,112,93,232,101,212,61,142,254,106,
+  253,221,237,118,111,170,29,83,117,119,122,50,69,89,59,97,0,164,178,221,
+  24,221,250,149,168,74,188,254,16,85,181,130,60,206,237,245,225,109,100,62,
+  237,109,184,75,183,238,63,6,183,26,86,124,252,233,30,134,162,130,62,154,
+  58,213,197,209,32,60,94,199,78,64,70,180,53,163,186,248,233,222,124,61,
+  41,139,47,2,86,162,140,34,88,2,64,224,179,63,5,8,202,9,138,78,
+  22,244,225,35,165,90,232,205,30,10,47,104,125,141,94,186,42,236,199,120,
+  17,39,39,5,62,230,26,198,55,96,184,159,101,37,172,222,27,94,137,139,
+  48,99,199,254,187,242,238,252,234,253,235,94,91,92,158,94,93,89,63,127,
+  161,63,213,157,241,180,182,34,2,31,109,72,54,2,62,174,150,68,81,21,
+  191,156,190,122,141,42,232,79,65,21,3,68,249,217,58,50,53,124,56,125,
+  247,102,29,129,46,237,40,31,211,187,20,39,215,188,80,210,233,216,138,83,
+  189,103,197,161,245,128,106,110,248,150,111,202,79,28,139,206,143,0,92,107,
+  151,190,114,35,15,230,88,124,134,153,207,208,158,100,31,44,53,243,92,12,
+  54,81,174,254,213,132,250,36,23,117,148,141,166,234,171,47,54,87,246,229,
+  75,89,175,250,69,162,146,61,199,246,166,119,89,77,234,232,125,94,169,0,
+  218,100,234,136,62,247,121,237,85,46,68,37,45,116,84,212,167,35,64,125,
+  194,89,84,63,162,26,61,4,230,32,61,135,71,52,245,242,253,24,85,203,
+  69,70,29,190,236,93,188,238,206,249,106,20,222,24,15,139,112,242,113,173,
+  123,211,215,201,169,19,82,64,210,151,185,165,148,235,24,141,156,91,33,158,
+  22,124,4,106,9,224,206,204,107,253,56,65,152,91,93,104,33,124,4,181,
+  246,199,117,77,112,92,181,13,69,62,177,129,214,199,33,74,233,161,175,199,
+  6,157,217,190,163,45,60,63,221,103,188,18,184,163,242,126,226,35,23,130,
+  134,139,103,182,82,168,192,111,167,20,168,176,175,11,89,150,213,197,71,35,
+  58,186,40,36,43,57,51,190,29,203,143,102,150,62,95,205,44,232,29,78,
+  154,55,253,50,57,126,78,60,82,187,159,152,242,228,88,253,137,121,214,221,
+  218,167,3,229,39,31,81,83,129,218,147,123,73,142,171,83,231,175,160,45,
+  146,1,15,42,91,252,175,253,120,149,10,245,184,57,2,159,142,174,54,25,
+  35,63,72,111,1,40,87,141,68,244,13,40,57,153,244,254,96,101,136,110,
+  251,206,96,202,234,160,27,156,20,145,234,34,47,125,244,104,165,224,135,110,
+  82,128,150,23,180,187,162,15,176,193,54,32,170,84,25,26,6,127,81,77,
+  90,14,163,89,93,146,164,139,4,93,233,156,148,203,104,235,186,182,85,120,
+  255,150,134,169,102,204,152,120,242,49,163,117,51,181,28,91,166,7,233,181,
+  222,26,69,172,44,149,86,37,74,72,251,199,120,88,232,239,92,108,154,128,
+  129,111,222,81,65,95,23,164,106,198,59,24,178,50,213,157,204,122,73,55,
+  200,156,228,244,46,45,134,234,173,187,151,138,246,30,43,160,125,242,37,234,
+  103,51,18,190,164,122,196,239,120,131,197,130,239,170,81,213,140,54,181,139,
+  140,48,157,206,161,237,21,121,255,103,194,158,25,56,231,35,94,181,192,239,
+  42,168,105,56,149,142,110,164,62,10,157,120,122,52,8,175,233,8,15,139,
+  153,205,90,82,160,240,49,148,218,160,1,81,95,125,84,205,70,105,250,254,
+  163,242,147,74,224,159,144,250,182,185,233,213,60,124,214,146,2,174,130,234,
+  121,71,204,73,153,255,32,146,157,89,233,214,146,147,114,250,21,181,113,19,
+  96,162,203,24,7,153,83,105,229,101,67,199,126,247,6,225,254,205,113,227,
+  164,252,132,156,118,245,201,77,26,242,182,146,193,162,111,237,89,239,88,190,
+  224,167,15,73,184,218,0,163,237,99,191,146,125,55,155,77,209,79,143,102,
+  94,172,166,126,39,237,174,244,101,95,134,97,134,222,66,160,76,176,5,120,
+  242,17,162,92,173,235,231,134,213,56,60,216,171,230,80,212,142,99,223,85,
+  245,181,25,89,211,165,177,168,107,19,227,149,90,47,253,42,148,116,233,156,
+  129,88,29,187,172,132,52,30,8,70,172,183,204,32,235,6,18,215,27,232,
+  231,136,84,23,43,67,189,157,131,157,154,155,147,180,5,60,249,168,159,233,
+  162,49,189,133,84,69,250,172,155,47,165,147,94,174,65,135,24,89,229,105,
+  227,226,64,210,134,80,179,65,219,15,16,100,137,202,132,246,227,111,22,76,
+  237,27,187,167,106,12,116,187,156,97,15,163,105,96,43,73,183,193,209,136,
+  90,154,89,190,188,41,171,57,149,157,203,211,55,175,206,190,60,127,247,246,
+  195,155,183,239,123,95,120,183,144,19,140,119,92,139,54,4,129,71,182,42,
+  198,145,85,215,61,187,142,186,140,33,201,193,46,165,251,113,83,188,186,9,
+  35,53,156,188,85,235,71,146,4,125,75,108,202,23,17,207,82,25,198,51,
+  138,91,178,30,113,9,122,220,60,121,92,232,4,180,107,13,37,215,207,113,
+  226,157,222,116,213,216,93,63,200,73,231,96,82,155,78,170,98,196,73,151,
+  91,229,124,214,40,148,212,183,96,97,34,237,89,159,30,17,38,180,246,178,
+  121,235,66,92,63,231,144,33,228,163,205,124,117,101,6,199,148,111,68,211,
+  39,160,165,214,238,4,9,57,114,33,66,34,144,108,205,226,72,28,54,159,
+  181,196,137,40,116,99,163,208,30,83,6,152,241,98,162,45,30,63,174,46,
+  227,192,91,10,4,111,191,124,185,55,9,149,57,201,152,149,196,15,243,91,
+  203,156,195,61,41,72,117,146,11,17,41,188,74,118,60,39,212,104,24,50,
+  58,154,216,183,35,218,217,27,21,215,66,129,4,159,78,75,161,178,238,131,
+  234,65,53,52,220,250,102,27,115,73,20,198,165,198,57,223,90,230,248,25,
+  68,7,159,122,107,81,165,253,225,194,108,179,206,197,67,79,8,156,221,32,
+  134,100,16,174,90,43,22,37,7,133,134,181,52,42,204,98,173,153,159,194,
+  48,214,15,146,93,216,204,84,134,104,89,212,225,173,214,171,165,100,47,77,
+  215,116,15,209,105,209,92,172,126,107,5,3,213,167,129,67,35,218,212,145,
+  20,85,185,121,228,219,175,125,12,131,146,54,127,156,35,80,148,172,1,217,
+  245,67,84,129,231,48,99,105,217,49,30,166,246,173,126,56,41,82,178,171,
+  222,233,235,243,204,120,90,24,35,182,26,88,233,200,131,207,244,250,204,73,
+  205,28,126,225,164,7,70,118,37,212,66,2,101,178,30,115,164,53,103,233,
+  192,214,156,74,251,52,187,211,31,34,129,167,105,147,47,95,214,203,233,82,
+  36,56,106,212,78,194,41,212,188,244,14,146,89,172,38,171,106,87,164,98,
+  43,84,86,180,74,116,249,120,73,6,12,143,137,147,76,203,6,178,239,203,
+  113,161,178,85,232,136,54,109,167,207,106,110,205,28,24,164,235,174,150,123,
+  245,57,211,35,0,212,213,231,237,254,39,229,154,222,247,79,193,9,247,71,
+  86,49,141,68,245,33,223,181,65,158,31,165,232,0,22,64,170,41,172,150,
+  230,61,52,34,96,149,193,223,101,211,24,98,18,69,96,24,33,27,103,43,
+  47,123,189,75,177,212,246,244,229,34,29,40,140,201,180,131,107,70,225,193,
+  54,14,2,71,228,73,7,215,57,170,235,105,138,30,99,108,79,85,60,28,
+  66,138,105,182,248,120,73,138,166,169,32,156,147,194,44,71,27,161,127,98,
+  25,47,81,219,196,148,190,126,204,95,178,68,5,125,87,7,64,137,92,245,
+  54,229,149,20,61,141,250,49,12,181,240,56,238,15,174,77,25,95,3,34,
+  29,42,35,233,112,66,165,95,177,176,232,81,45,211,139,25,221,114,159,129,
+  225,103,3,132,215,48,123,158,212,111,248,107,95,159,111,231,119,228,57,132,
+  186,118,103,166,118,114,36,244,152,102,25,250,16,118,158,253,4,208,156,43,
+  34,227,97,46,101,131,203,202,191,44,246,115,149,196,87,105,120,243,244,16,
+  74,213,68,169,180,37,93,31,136,205,144,226,130,141,14,178,93,78,29,9,
+  197,74,201,180,9,157,11,205,217,15,51,106,116,180,95,52,196,179,0,52,
+  126,79,232,136,171,62,1,133,81,165,211,131,133,88,129,163,125,221,139,157,
+  130,66,136,255,191,86,138,249,112,90,95,45,148,105,108,17,73,80,106,11,
+  154,149,202,188,24,62,41,27,115,147,58,6,116,237,50,191,53,192,116,38,
+  142,34,239,181,166,209,139,37,223,26,108,161,30,168,41,162,14,51,169,72,
+  65,125,246,116,224,234,48,62,15,191,102,21,11,170,102,3,184,62,130,85,
+  60,168,211,237,36,69,198,141,110,99,212,198,173,10,233,136,74,106,9,171,
+  15,138,35,184,102,205,213,118,217,148,145,85,22,59,120,78,150,28,144,98,
+  254,15,199,97,90,220,55,122,86,40,23,164,255,158,57,173,109,28,157,153,
+  19,72,208,102,243,105,127,242,121,5,149,50,234,235,151,159,151,180,9,106,
+  128,100,98,81,199,103,18,134,228,106,56,202,61,245,231,182,31,153,217,155,
+  13,83,33,4,33,157,53,78,24,179,152,157,26,29,91,71,64,50,226,251,
+  25,221,104,117,178,164,93,48,37,75,24,111,222,246,196,105,175,119,122,246,
+  242,252,133,185,200,131,175,207,82,236,203,7,146,188,41,31,125,240,249,190,
+  65,207,179,196,99,86,242,199,191,36,167,168,196,173,104,253,55,9,64,200,
+  219,33,167,92,84,203,235,243,23,103,201,149,50,65,200,135,74,30,47,197,
+  226,250,95,190,60,173,62,121,204,23,136,249,246,13,76,30,5,158,214,218,
+  4,141,62,32,189,20,182,126,78,243,240,197,202,139,68,81,211,169,22,190,
+  128,38,151,11,228,228,240,211,125,110,78,97,145,4,157,106,102,173,164,62,
+  133,105,47,13,57,147,208,242,116,134,126,234,79,22,98,146,15,244,204,205,
+  181,121,115,12,20,151,138,79,244,244,8,127,95,8,241,215,242,169,63,145,
+  183,139,191,63,154,248,73,135,249,3,68,249,131,88,233,122,233,160,91,190,
+  210,129,53,148,253,25,152,80,25,147,106,128,95,126,94,3,230,85,134,201,
+  231,227,220,18,95,90,76,139,121,64,106,243,108,118,146,118,103,172,177,62,
+  6,183,90,39,93,200,217,231,243,80,79,42,230,105,76,201,144,226,136,96,
+  120,55,132,87,67,1,132,150,123,187,16,83,149,9,108,244,113,185,108,215,
+  209,114,205,128,195,135,106,135,0,248,68,92,49,0,103,22,26,74,31,124,
+  219,0,198,7,229,18,130,124,184,45,11,56,32,37,240,56,244,78,230,228,
+  50,69,15,205,199,25,176,236,52,220,3,83,109,233,50,83,91,12,237,89,
+  196,66,230,243,71,124,38,149,154,162,50,71,138,156,64,234,209,153,220,181,
+  149,78,203,113,31,211,9,187,149,168,133,174,14,164,219,119,180,154,78,135,
+  113,159,102,68,56,196,208,241,147,88,155,159,51,247,222,181,51,111,244,121,
+  190,116,162,142,15,232,229,194,206,1,47,75,209,177,85,216,137,181,212,144,
+  77,206,217,185,190,169,53,140,103,17,183,33,133,110,235,235,185,160,22,174,
+  175,167,187,137,9,125,119,134,237,33,191,30,87,179,161,188,161,21,218,211,
+  147,245,245,170,87,239,78,47,234,202,30,73,125,150,141,143,22,46,81,139,
+  166,57,19,56,190,69,149,174,240,76,249,226,187,116,249,215,57,218,250,54,
+  63,250,89,30,90,41,231,53,29,212,49,73,110,172,164,123,9,7,146,207,
+  34,47,227,205,100,152,250,121,85,126,59,160,72,14,169,56,7,148,80,151,
+  161,57,193,88,69,138,54,171,84,254,186,174,221,208,218,240,199,228,120,228,
+  79,247,215,203,101,179,254,206,184,70,107,83,139,228,196,36,94,223,44,150,
+  71,37,63,86,173,79,129,235,87,140,227,76,43,161,85,34,145,76,99,103,
+  112,211,21,34,149,169,36,135,196,19,225,57,140,236,132,120,134,242,58,61,
+  51,61,158,67,78,166,204,55,80,203,78,163,231,241,178,211,233,25,170,169,
+  113,228,101,56,132,164,75,107,25,171,187,55,193,188,27,89,230,130,56,51,
+  107,156,156,197,172,90,201,156,7,173,50,155,35,150,43,133,73,38,144,43,
+  228,51,148,43,101,122,68,164,69,134,182,241,0,124,8,113,197,84,106,0,
+  178,45,145,69,235,242,139,228,26,59,203,178,146,245,173,41,58,18,22,164,
+  150,177,207,120,252,25,202,195,191,146,227,208,146,151,6,180,111,43,205,90,
+  100,65,55,245,109,61,83,85,173,86,23,255,34,155,10,30,220,81,69,19,
+  169,234,25,199,124,20,157,174,24,71,150,94,129,169,106,148,31,150,187,52,
+  170,247,64,244,121,137,76,207,234,103,215,197,200,212,242,77,226,249,151,203,
+  117,177,78,126,237,63,93,233,236,172,172,252,87,136,176,208,148,90,133,164,
+  90,95,190,160,65,26,98,183,16,98,55,3,49,162,229,43,62,85,139,30,
+  249,225,135,252,178,156,33,229,176,163,201,49,150,172,182,118,120,45,131,46,
+  181,77,119,45,228,204,33,189,87,38,200,72,168,0,194,204,177,153,250,205,
+  117,116,57,136,229,92,40,223,233,144,110,149,89,6,180,72,18,110,191,124,
+  73,94,116,204,254,153,52,162,213,175,117,41,113,97,174,237,201,107,88,138,
+  77,82,166,27,123,200,190,220,22,21,167,173,55,212,249,21,175,179,228,95,
+  233,56,203,52,76,223,52,179,2,145,75,50,86,18,137,118,171,97,80,249,
+  202,174,4,179,66,19,151,143,30,209,103,58,217,135,62,164,11,231,202,9,
+  41,190,38,53,65,48,27,179,146,37,66,246,244,230,134,204,53,16,179,182,
+  71,191,230,147,110,56,226,45,65,139,210,162,84,178,121,121,43,221,90,64,
+  241,72,133,183,132,208,224,52,155,66,58,188,51,137,113,74,112,2,119,247,
+  96,137,54,250,176,254,208,115,216,181,105,153,95,103,171,149,242,142,61,115,
+  119,20,255,162,70,185,118,63,180,209,237,20,66,213,233,242,39,89,94,84,
+  59,139,33,205,230,87,124,25,157,135,97,245,158,22,156,230,247,138,174,146,
+  2,28,162,171,5,111,222,161,225,23,90,193,117,53,247,158,38,18,202,53,
+  154,118,105,135,150,38,66,243,189,204,208,167,132,161,79,134,161,208,250,132,
+  32,182,146,82,228,25,134,117,154,92,108,168,154,205,21,159,32,175,236,38,
+  172,116,235,85,185,92,163,249,57,26,166,166,82,73,251,48,196,18,250,201,
+  147,142,230,126,89,116,220,109,49,16,149,202,71,143,164,197,132,187,221,46,
+  55,183,186,172,28,161,1,237,59,212,167,166,67,190,7,134,79,72,243,111,
+  251,89,226,85,164,239,249,51,225,9,101,22,250,250,84,114,80,51,186,87,
+  229,237,204,220,129,241,254,234,121,18,60,76,97,91,232,222,45,100,48,205,
+  230,126,171,209,104,39,119,32,131,141,48,138,103,98,64,7,16,66,115,229,
+  59,12,160,164,115,105,227,90,38,234,98,178,52,104,137,108,29,85,194,185,
+  120,238,181,244,244,117,153,251,72,39,205,173,9,20,199,240,53,52,188,194,
+  180,107,237,226,21,197,23,202,226,208,86,112,68,177,46,8,238,215,53,73,
+  188,224,134,155,13,71,136,70,120,10,174,252,68,90,164,0,136,206,105,87,
+  73,70,221,30,38,161,187,121,19,13,254,229,13,186,161,5,246,204,231,27,
+  26,245,173,41,212,19,60,152,197,175,87,111,223,88,226,140,140,88,122,175,
+  153,142,205,114,116,215,234,55,55,20,196,51,135,150,229,72,43,244,18,3,
+  31,166,135,26,162,30,154,27,209,220,78,165,82,148,20,165,223,218,146,119,
+  152,9,40,231,98,132,224,208,243,238,238,151,91,5,59,139,162,65,172,162,
+  10,93,183,83,163,223,249,33,197,51,251,224,102,81,247,158,46,231,9,156,
+  118,249,242,237,85,175,92,211,63,162,163,218,247,229,63,234,239,40,161,85,
+  72,188,235,116,227,10,178,158,55,209,140,127,12,232,34,112,202,139,133,118,
+  136,92,35,42,178,232,75,151,62,210,88,35,111,5,152,62,0,171,102,235,
+  97,102,44,150,74,48,87,35,246,121,250,254,208,174,110,128,236,30,223,75,
+  107,70,215,8,248,145,185,117,179,178,92,224,97,138,180,29,239,253,187,215,
+  87,146,34,149,75,27,1,176,170,220,195,167,181,243,206,217,236,146,171,145,
+  79,110,175,248,230,90,244,185,93,180,165,174,6,33,147,215,109,175,120,223,
+  228,53,249,219,246,138,223,205,188,27,5,237,117,151,123,82,110,66,144,141,
+  50,213,13,159,218,206,123,219,26,187,214,246,170,143,173,177,71,109,175,187,
+  214,180,54,237,81,219,5,190,53,75,144,125,70,123,213,121,212,180,163,104,
+  175,185,140,133,73,4,249,30,215,76,28,199,134,159,122,140,174,112,93,217,
+  104,166,127,67,0,225,90,217,184,6,221,85,137,253,101,77,52,254,192,252,
+  218,76,89,43,165,113,107,166,206,101,32,246,201,162,153,243,181,148,134,120,
+  114,126,186,255,68,225,11,5,192,100,183,168,177,200,225,232,230,139,180,132,
+  39,69,210,105,200,79,198,63,254,144,89,59,97,156,222,31,24,111,201,91,
+  152,17,231,249,180,156,93,158,106,111,92,75,254,100,173,172,145,25,91,79,
+  124,87,87,183,244,146,67,73,125,68,81,107,11,82,196,80,143,66,99,38,
+  210,60,106,81,216,53,134,74,103,205,4,32,133,228,17,8,71,87,220,41,
+  252,146,55,11,51,231,27,34,116,211,218,206,210,211,45,116,132,0,126,242,
+  105,68,224,15,61,119,120,205,27,87,137,184,238,116,202,69,118,102,9,80,
+  167,148,205,49,30,192,208,115,210,6,62,73,63,30,128,95,238,102,49,56,
+  38,59,121,136,41,100,184,12,164,17,116,234,242,0,60,210,109,186,216,133,
+  224,87,68,29,177,60,131,141,146,78,42,153,34,108,41,178,94,65,53,25,
+  12,201,109,81,171,227,193,44,116,174,13,138,224,154,84,28,193,234,138,126,
+  215,121,209,142,20,28,127,51,106,205,227,71,142,11,215,62,147,137,106,33,
+  125,184,86,190,91,139,103,33,178,203,161,102,53,244,27,198,198,138,254,23,
+  53,240,27,134,128,214,185,183,163,209,74,87,233,30,184,215,161,121,123,37,
+  112,95,152,30,126,169,67,245,2,60,10,226,219,171,209,124,22,173,213,120,
+  0,145,174,80,76,128,245,101,128,133,176,188,220,210,134,113,174,241,106,9,
+  211,211,119,54,102,8,174,104,214,60,209,44,202,23,110,47,214,173,239,60,
+  8,175,183,52,191,243,219,175,105,95,66,225,171,182,88,175,40,146,50,153,
+  92,133,85,46,185,196,90,175,252,167,239,114,171,254,255,91,253,89,103,241,
+  155,181,231,131,206,187,178,61,116,191,154,142,173,60,27,31,111,69,193,123,
+  250,237,223,51,91,73,24,192,185,233,87,221,204,246,10,14,37,57,90,39,
+  248,234,226,60,65,131,202,113,18,169,68,162,62,189,34,211,104,244,135,77,
+  226,215,244,135,43,209,11,132,73,21,172,82,220,202,82,222,196,228,221,184,
+  249,153,143,45,20,105,179,33,187,39,107,179,146,81,47,182,50,110,69,182,
+  141,111,186,21,93,97,76,156,89,208,226,239,63,235,172,127,39,73,227,191,
+  182,184,149,85,191,255,143,214,203,216,8,189,251,117,189,127,50,47,243,161,
+  151,238,130,165,63,82,12,212,41,130,95,198,3,201,17,157,142,241,215,232,
+  225,228,215,181,42,84,84,99,153,117,232,38,45,125,111,214,209,142,254,81,
+  208,29,254,121,250,255,7,135,214,36,250,174,126,0,0
 };
 
 
@@ -2722,6 +2957,20 @@ void applyRaw(uint16_t v) {                 // drive only, no NVS write
 }
 
 // Calibrated temperature -> raw. Saturates at both ends of the curve.
+// Snap a requested temperature to what the face can actually show. Applied BEFORE the
+// calibration offset, deliberately: the offset exists to nudge a reading that lands just the
+// wrong side of a boundary, and quantising after it would discard every nudge smaller than a
+// whole degree, which is all of them.
+float quantiseC(float c) {
+#if TEMP_WHOLE_DEGREES == 1
+  return (float)(long)c;                      // toward zero: 21.9 -> 21, -3.7 -> -3
+#elif TEMP_WHOLE_DEGREES == 2
+  return (float)(long)(c >= 0.0f ? c + 0.5f : c - 0.5f);
+#else
+  return c;
+#endif
+}
+
 uint16_t rawForC(float c) {
   c += impl::offsetC_;
   if (c <= (float)TEMP_CURVE[0].c) return TEMP_CURVE[0].raw;
@@ -2740,7 +2989,10 @@ uint16_t rawForC(float c) {
 namespace impl {
 
 // Drive one temperature, encoding sub-zero values as a magnitude the display can show.
-void driveC(float c) {
+// Quantised here rather than inside rawForC so the march and a manual hold can still ask for
+// an exact value when a test wants one.
+void driveC(float cIn) {
+  const float c = quantiseC(cIn);
   if (c >= 0.0f) {
     negActive_ = false;
     applyRaw(rawForC(c));
@@ -2822,6 +3074,9 @@ int      marchStepC()    { return impl::marchStep_ < TEMP_CURVE_N
 bool     negActive()     { return impl::negActive_; }
 bool     targetValid()   { return impl::targetValid_; }
 float    targetC()       { return impl::targetC_; }
+// What actually reaches the face, after whole-degree snapping. Reported next to the raw
+// reading so the UI and the display cannot disagree.
+float    quantisedTargetC() { return quantiseC(impl::targetC_); }
 
 // Whole seconds of hold left. Guards the wrap: millis() can pass holdUntil_ before loop()
 // clears it, and an unsigned subtract there would report ~49 days remaining.
@@ -3038,6 +3293,62 @@ class FieldScan {
 
 bool accept(const FieldScan& fsTemp, const FieldScan& fsTime);
 
+// Set when a fetch saw a 404 and a suffix probe is worth running once the session is closed.
+bool wantProbe_ = false;
+// One probe per station per suffix. Without this, a host answering HEAD 200 while answering
+// GET 404 would flip the cached suffix back and forth at network round-trip rate, with a full
+// settings write per cycle.
+bool probeExhausted_ = false;
+
+// Build the observation URL. A station containing '-' is already a complete stem (CYYZ-MAN)
+// and gets only the extension; a bare code gets the suffix it is given.
+void buildUrl(char* out, size_t n, const char* suffix) {
+  if (settings::wxStationIsStem(g_settings.wxStation))
+    std::snprintf(out, n, "%s://%s%s%s-swob.xml", WX_USE_HTTPS ? "https" : "http",
+                  WX_HOST, WX_PATH_PREFIX, g_settings.wxStation);
+  else
+    std::snprintf(out, n, "%s://%s%s%s%s", WX_USE_HTTPS ? "https" : "http",
+                  WX_HOST, WX_PATH_PREFIX, g_settings.wxStation, suffix);
+}
+
+// HEAD one URL and return the status code, or a negative HTTPClient error. Only used to find
+// which suffix a bare code lives under, so the body is never wanted. Verified against the live
+// host: it answers HEAD with the same 200 or 404 it answers a GET with.
+int headCode(const char* url) {
+#if WX_USE_HTTPS
+  WiFiClientSecure client;
+  client.setInsecure();
+#else
+  WiFiClient client;
+#endif
+  HTTPClient http;
+  http.setConnectTimeout(WX_PROBE_TIMEOUT_MS);
+  http.setTimeout(WX_PROBE_TIMEOUT_MS);
+  http.setReuse(false);
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  if (!http.begin(client, url)) return -1;
+  const int code = http.sendRequest("HEAD");
+  http.end();
+  return code;
+}
+
+// A 404 means either the wrong suffix or a wrong station code. Try the other suffix; adopt it
+// only on a 200, so a station that is simply down, or a code that is wrong, cannot corrupt the
+// cache. Returns true when the cache changed and the caller should try again.
+bool reprobeSuffix() {
+  if (settings::wxStationIsStem(g_settings.wxStation)) return false;
+  const bool onAuto = (std::strcmp(g_settings.wxSuffix, WX_PATH_SUFFIX) == 0);
+  const char* other = onAuto ? WX_PATH_SUFFIX_ALT : WX_PATH_SUFFIX;
+  char url[192];
+  buildUrl(url, sizeof url, other);
+  if (headCode(url) != HTTP_CODE_OK) return false;
+  std::strncpy(g_settings.wxSuffix, other, sizeof g_settings.wxSuffix - 1);
+  g_settings.wxSuffix[sizeof g_settings.wxSuffix - 1] = '\0';
+  settings::save();
+  Serial.printf("[wx] %s is %s\n", g_settings.wxStation, other);
+  return true;
+}
+
 // One fetch attempt. Returns true only when a fresh reading was applied to the output.
 bool doFetch() {
   lastAttempt_ = millis();
@@ -3057,8 +3368,7 @@ bool doFetch() {
   attempts_++;
 
   char url[192];
-  std::snprintf(url, sizeof url, "%s://%s%s%s%s", WX_USE_HTTPS ? "https" : "http",
-                WX_HOST, WX_PATH_PREFIX, g_settings.wxStation, WX_PATH_SUFFIX);
+  buildUrl(url, sizeof url, g_settings.wxSuffix);
 
   bool applied = false;
   {
@@ -3087,6 +3397,10 @@ bool doFetch() {
         std::snprintf(m, sizeof m, "HTTP %d%s", lastCode_,
                       lastCode_ == 404 ? " (station code wrong?)" : "");
         setError(m);
+        // Only NOTE that a probe is wanted. Running it here would build a SECOND TLS session
+        // while this one is still open, on a heap only ever checked to hold one, and would
+        // commit to NVS mid-session. It runs after this scope closes.
+        wantProbe_ = (lastCode_ == 404);
       } else {
         WiFiClient* s = http.getStreamPtr();
         FieldScan fsTime("\"date_tm\""), fsTemp("\"air_temp\"");
@@ -3117,6 +3431,22 @@ bool doFetch() {
   }
 
   heapAfter_ = (uint32_t)ESP.getFreeHeap();
+
+  // The session is closed now, so a probe can have the heap to itself.
+  if (wantProbe_ && !probeExhausted_) {
+    wantProbe_ = false;
+    probeExhausted_ = true;
+    if (!WX_USE_HTTPS ||
+        heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= WX_MIN_LARGEST_BLOCK) {
+      if (reprobeSuffix()) {
+        char m[64];
+        std::snprintf(m, sizeof m, "HTTP 404, retrying as %s", g_settings.wxSuffix);
+        setError(m);
+        pending_ = true;                    // retry now, with the corrected suffix
+      }
+    }
+  }
+  wantProbe_ = false;
   if (applied) { lastOk_ = millis(); everOk_ = true; }
   return applied;
 }
@@ -3181,6 +3511,7 @@ void begin() {
 }
 
 void requestNow() { impl::pending_ = true; }
+void allowProbe() { impl::probeExhausted_ = false; }
 
 void loop() {
 #if WX_ENABLE
@@ -3360,7 +3691,6 @@ String flagText(uint16_t f) {
       !(f & (ds1302::TF_TOO_SLOW | ds1302::TF_LONG | ds1302::TF_TIMEOUT)), "answered by DS1302");
   add(f & ds1302::TF_COMPLETE, "complete");
   add(f & ds1302::TF_LATE_EDGE, "SCLK edge before ISR");
-  add(f & ds1302::TF_CE_BOUNCE, "CE glitch rejected");
   add(f & ds1302::TF_TOO_SLOW, "over ISR budget");
   add(f & ds1302::TF_TIMEOUT, "timeout");
   add(f & ds1302::TF_LONG, "RAM burst not followed");
@@ -3435,6 +3765,9 @@ void handleStatus() {
                                        * (uint32_t)TEMP_NODE_MV_MAX / TEMP_RAW_MAX))
       .unum("temp_mv_max", (unsigned long)TEMP_NODE_MV_MAX)
       .real("temp_offset", tempout::offsetC(), 1)
+      .real("temp_target_c", tempout::targetC(), 1)
+      .real("temp_sent_c", tempout::quantisedTargetC(), 1)
+      .num("temp_whole_degrees", (long)TEMP_WHOLE_DEGREES)
       .unum("temp_raw_max", (unsigned long)TEMP_RAW_MAX)
       .unum("temp_pwm_hz", (unsigned long)tempout::freqHz())
       .unum("temp_pwm_hz_want", (unsigned long)TEMP_PWM_FREQ_HZ)
@@ -3510,6 +3843,17 @@ void handleStatus() {
 
   j.open("ntp").str("server", timekeeping::server()).boolean("synced", timekeeping::everSynced())
       .unum("sync_count", timekeeping::syncCount()).unum("interval_s", timekeeping::syncIntervalS());
+  j.str("server2", g_settings.ntpServer2).str("server3", g_settings.ntpServer3)
+      .boolean("failover", g_settings.ntpFailover)
+      .num("active_slot", (long)timekeeping::activeSlot())
+      .str("active_role", timekeeping::activeSlot() == 0 ? "primary" : "fallback");
+  // drift_ppm is the long baseline; drift_recent_ppm is the shorter window and is the one that
+  // moves when the board warms up. drift_ppm_err is the estimator's own noise floor, so a
+  // figure quoted from a short baseline is visibly worthless rather than merely wrong.
+  j.boolean("drift_measured", timekeeping::driftSpanS() > 0)
+      .real("drift_ppm_err", timekeeping::driftUncertaintyPpm(), 2)
+      .real("drift_recent_ppm", timekeeping::driftRecentPpm(), 2)
+      .unum("drift_recent_span_s", timekeeping::driftRecentSpanS());
   j.boolean("drift_valid", timekeeping::driftValid())
       .real("drift_ppm", timekeeping::driftPpm(), 2)
       .unum("drift_span_s", timekeeping::driftSpanS());
@@ -3543,6 +3887,14 @@ void handleStatus() {
       .str("hour_format", settings::hourFormatName(g_settings.hourFormat))
       .str("hour_mode", st.hour12 ? "12h" : "24h")
       .str("mcu_hour", snap.learnedHour < 0 ? "unknown" : (snap.learnedHour ? "12h" : "24h"))
+      // Why the clock is in the mode it is in. On "auto" the format is learned from the MCU
+      // writing the hours register, which with the DS1302 removed happens only if someone sets
+      // the time with the clock's buttons - so on a fresh build there is usually nothing to
+      // learn from and it sits on 24 hour. Stating the reason beats leaving it to be worked
+      // out from three separate fields.
+      .str("hour_source", g_settings.hourFormat != HOURFMT_AUTO ? "forced by setting"
+                        : snap.learnedHour >= 0 ? "learned from the MCU"
+                        : "default: the MCU has never written the hours register")
       .unum("holdover_h", (unsigned long)NTP_HOLDOVER_HOURS)
       .close();
 
@@ -3567,7 +3919,6 @@ void handleStatus() {
       .unum("invalid", c.invalid).unum("late_sclk_high", c.misaligned).unum("late_sclk_edge", c.lateEdge)
       .unum("late_ce_low", c.glitches).unum("over_budget", c.tooSlow).unum("timeouts", c.timeouts)
       .unum("ram_burst", c.longTxn).unum("incomplete", c.incomplete)
-      .unum("ce_bounces", c.ceBounces)
       .close();
   j.close();
 
@@ -3645,11 +3996,14 @@ void handleWx() {
     s.trim();
     s.toUpperCase();
     if (!settings::validWxStation(s.c_str())) {
-      sendError(400, "station: 3-7 upper-case letters or digits, e.g. CWWB");
+      sendError(400, "station: 3-14 upper-case letters, digits and '-', e.g. CWWB or CYYZ-MAN");
       return;
     }
     std::strncpy(g_settings.wxStation, s.c_str(), sizeof g_settings.wxStation - 1);
     g_settings.wxStation[sizeof g_settings.wxStation - 1] = '\0';
+    std::strncpy(g_settings.wxSuffix, WX_PATH_SUFFIX, sizeof g_settings.wxSuffix - 1);
+    g_settings.wxSuffix[sizeof g_settings.wxSuffix - 1] = '\0';
+    wx::allowProbe();
     if (!settings::save()) { sendError(500, "could not save station"); return; }
     wx::requestNow();                       // new station, so re-fetch immediately
   } else if (server.hasArg("fetch")) {
@@ -3670,7 +4024,10 @@ void handleSettings() {
   uint8_t hf = g_settings.hourFormat;
   uint8_t dst = g_settings.dstMode;
   uint32_t ival = g_settings.syncIntervalS;
-  int spoofVal = -1, bootVal = -1;
+  int spoofVal = -1, bootVal = -1, ntpfoVal = -1;
+  String ntp2, ntp3;
+  const bool haveNtp2 = server.hasArg("ntp2");
+  const bool haveNtp3 = server.hasArg("ntp3");
   int txDbm = g_settings.wifiTxDbm, psMode = g_settings.wifiPsMode;
 
   if (server.hasArg("txdbm")) {
@@ -3688,6 +4045,21 @@ void handleSettings() {
     ntp = server.arg("ntp");
     ntp.trim();
     if (!settings::validNtpServer(ntp.c_str())) err = "NTP server: hostname or IPv4 address (letters, digits, dots, hyphens; max 63)";
+  }
+  // An empty fallback is legal and clears that slot, so only a non-empty value is validated.
+  if (err.isEmpty() && haveNtp2) {
+    ntp2 = server.arg("ntp2"); ntp2.trim();
+    if (ntp2.length() && !settings::validNtpServer(ntp2.c_str()))
+      err = "NTP fallback 1: hostname or IPv4 address, or empty to disable";
+  }
+  if (err.isEmpty() && haveNtp3) {
+    ntp3 = server.arg("ntp3"); ntp3.trim();
+    if (ntp3.length() && !settings::validNtpServer(ntp3.c_str()))
+      err = "NTP fallback 2: hostname or IPv4 address, or empty to disable";
+  }
+  if (err.isEmpty() && server.hasArg("ntpfo")) {
+    const String v = server.arg("ntpfo");
+    if (v == "1") ntpfoVal = 1; else if (v == "0") ntpfoVal = 0; else err = "ntpfo: 0 or 1";
   }
   if (err.isEmpty() && haveTz) {
     tz = server.arg("tz");
@@ -3716,11 +4088,22 @@ void handleSettings() {
   }
   if (err.length()) { sendError(400, err.c_str()); return; }
 
-  const bool ntpChanged = haveNtp && std::strcmp(ntp.c_str(), g_settings.ntpServer) != 0;
+  const bool ntpChanged = (haveNtp && std::strcmp(ntp.c_str(), g_settings.ntpServer) != 0) ||
+                          (haveNtp2 && std::strcmp(ntp2.c_str(), g_settings.ntpServer2) != 0) ||
+                          (haveNtp3 && std::strcmp(ntp3.c_str(), g_settings.ntpServer3) != 0);
   const bool tzChanged = (haveTz && std::strcmp(tz.c_str(), g_settings.tz) != 0) || dst != g_settings.dstMode;
   const bool ivalChanged = ival != g_settings.syncIntervalS;
 
   if (haveNtp) strlcpy(g_settings.ntpServer, ntp.c_str(), sizeof g_settings.ntpServer);
+  if (haveNtp2) strlcpy(g_settings.ntpServer2, ntp2.c_str(), sizeof g_settings.ntpServer2);
+  if (haveNtp3) strlcpy(g_settings.ntpServer3, ntp3.c_str(), sizeof g_settings.ntpServer3);
+  // Turning failover off while parked on a fallback must not strand the device there.
+  if (ntpfoVal >= 0) {
+    const bool wasOn = g_settings.ntpFailover;
+    g_settings.ntpFailover = (ntpfoVal == 1);
+    if (wasOn && !g_settings.ntpFailover && timekeeping::activeSlot() != 0)
+      timekeeping::selectSlot(0);
+  }
   if (haveTz) strlcpy(g_settings.tz, tz.c_str(), sizeof g_settings.tz);
   g_settings.dstMode = dst;
   g_settings.hourFormat = hf;
@@ -3739,8 +4122,8 @@ void handleSettings() {
     settings::effectiveTz(active, sizeof active);
     timekeeping::setTz(active);
   }
-  if (ntpChanged) timekeeping::setServer(g_settings.ntpServer);
-  else if (ivalChanged) timekeeping::setSyncInterval(g_settings.syncIntervalS);
+  if (ivalChanged) timekeeping::setSyncInterval(g_settings.syncIntervalS);
+  if (ntpChanged)  timekeeping::setServer(g_settings.ntpServer);
 
   const bool saved = settings::save();
   String out;
@@ -3812,22 +4195,59 @@ uint32_t statusServed() { return impl::statusServed_; }
 
 namespace {
 
-uint32_t g_lastNtpKickMs = 0;
 bool     g_mdnsStarted = false;
 
 // If SNTP goes quiet for three intervals (or five minutes, whichever is longer) while the
 // link is up, kick it. Costs one extra request at most once a minute.
-void ntpWatchdog() {
-  if (!WiFi.isConnected()) return;
+// Strict primary with failover, replacing both the old kick-when-quiet watchdog and lwIP's
+// round-robin. Exactly one server is installed at a time, so this is the whole selection
+// policy. Silence is judged on the global last-sync age, which is sound here precisely because
+// only one server is ever installed: any sync in the window came from the active one.
+void ntpPolicy() {
+  if (!WiFi.isConnected()) return;                 // a dead link is not the server's fault
+
   const uint32_t now = millis();
-  if (now - g_lastNtpKickMs < 60000UL) return;
-  uint32_t limitS = timekeeping::syncIntervalS() * 3;
-  if (limitS < 300) limitS = 300;
-  const int64_t age = timekeeping::lastSyncAgeUs();
-  if (age < 0 || age > (int64_t)limitS * 1000000LL) {
-    timekeeping::syncNow();
-    g_lastNtpKickMs = now;
+  uint32_t windowS = timekeeping::syncIntervalS() * NTP_FAILOVER_AFTER_MULT;
+  if (windowS < NTP_FAILOVER_MIN_S) windowS = NTP_FAILOVER_MIN_S;
+
+  const uint32_t sinceSwitch = now - timekeeping::slotSinceMs();
+  const uint8_t  slot = timekeeping::activeSlot();
+
+  // Has the CURRENT server answered at all? selectSlot restarts SNTP, which sends a request
+  // immediately, so a reachable server answers within seconds. Counting syncs since the switch
+  // is unambiguous where the global age is not: the age may still be small because the
+  // PREVIOUS server answered a moment before the switch.
+  const bool answered = timekeeping::syncCount() > timekeeping::slotSyncCount();
+
+  if (!answered) {
+    if (sinceSwitch < NTP_PROBE_S * 1000UL) return;            // still inside its grace period
+    const uint8_t next = timekeeping::nextUsableSlot(slot);
+    Serial.printf("[ntp] %s did not answer in %lus, %s\n", timekeeping::server(),
+                  (unsigned long)NTP_PROBE_S,
+                  next == slot ? "restarting the request" : "trying the next server");
+    timekeeping::selectSlot(next);
+    return;
   }
+
+  const int64_t age = timekeeping::lastSyncAgeUs();
+  const bool healthy = age >= 0 && age <= (int64_t)windowS * 1000000LL;
+
+  if (healthy) {
+    // On a fallback and the primary has had long enough to recover: give it the slot back. If
+    // it is still down this costs one poll and the next pass demotes again.
+    if (slot != 0 && g_settings.ntpFailover &&
+        sinceSwitch >= NTP_RETURN_PRIMARY_S * 1000UL) {
+      Serial.println("[ntp] returning to the primary server");
+      timekeeping::selectSlot(0);
+    }
+    return;
+  }
+
+  const uint8_t next = timekeeping::nextUsableSlot(slot);
+  Serial.printf("[ntp] %s silent for %lus, %s\n", timekeeping::server(),
+                (unsigned long)windowS,
+                next == slot ? "restarting the request" : "failing over");
+  timekeeping::selectSlot(next);
 }
 
 }  // namespace
@@ -3876,8 +4296,9 @@ void loop() {
   wifimgr::loop();
 
   if (wifimgr::takeGotIp()) {
-    timekeeping::restart();                 // immediate NTP request on every (re)connect
-    g_lastNtpKickMs = millis();
+    // Re-anchor on the primary: a reconnect is a new network situation, and whatever drove
+    // the device onto a fallback may well have been the link itself.
+    timekeeping::selectSlot(0);             // immediate NTP request on every (re)connect
     if (!g_mdnsStarted && MDNS.begin(DEVICE_HOSTNAME)) {
       MDNS.addService("http", "tcp", 80);
       g_mdnsStarted = true;
@@ -3886,7 +4307,7 @@ void loop() {
                   WiFi.localIP().toString().c_str(), DEVICE_HOSTNAME);
   }
 
-  ntpWatchdog();
+  ntpPolicy();
   webui::loop();
   tempout::loop();
   wx::loop();
