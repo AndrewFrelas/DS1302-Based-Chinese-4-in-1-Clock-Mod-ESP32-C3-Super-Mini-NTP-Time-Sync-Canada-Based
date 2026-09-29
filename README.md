@@ -91,19 +91,6 @@ flash the file onto your ESP32-C3 SuperMini. After you have done that it should 
   got nothing it would accept, which points at interrupt latency (`late_sclk_edge`,
   `over_budget`) rather than CE noise.
 
-**Drift estimator is two-point** and its validity gate is too short.
-
-**No NTP failover** — a single server string.
-
-**Station suffix is hardcoded to `-AUTO-`**, so only automatic stations can be chosen from
-  the web UI. Staffed stations (Pearson `CYYZ-MAN`, Hamilton `CYHM-MAN`) are unreachable.
-  Planned fix: accept either form in the one field — a string containing `-` is used verbatim
-  as a full stem, a bare code probes `-AUTO-` then `-MAN-` and caches the winner in NVS so the
-  normal path stays a single request. Probe with HEAD if the host supports it. The station
-  validator is currently `[A-Z0-9]{3,7}` because the value goes straight into a URL; widen it
-  by exactly one character for `-` and nothing else, since `/`, `.` and `%` are a
-  path-traversal surface.
-
   **12/24-hour handling was originally coded to follow the MCU and defaults to 24 hour if unknown**, which some people will find annoying.
 
 For now I know this is a real basic write up but I wanted to just get the information out and while I did use claude for coding i wanted to write this section
