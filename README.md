@@ -1,6 +1,6 @@
 # DS1302-Based-Chinese-4-in-1-Clock-Mod-ESP32-C3-Super-Mini-NTP-Time-Sync-Canada-Based
 
-<img src="https://andrewfrelas.com/images/2c648675-4923-4c1a-ac4f-e0c0c9073953.png?v=2" alt="Clock">
+![Clock] (https://andrewfrelas.com/images/2c648675-4923-4c1a-ac4f-e0c0c9073953.png)
 
 Firmware to drive a Chinese DS1302 based Clock with a charger using a ESP32 C3 Super Mini for NTP Time - Canadian Based API used for temp.
 
